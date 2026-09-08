@@ -5748,6 +5748,7 @@ export async function evaluateExecutionWorkspaceReuseCompatibility(input: {
     typeof resolveExecutionWorkspaceMode
   >;
   requestedBranchName?: string | null;
+  expectedRepoRoot?: string | null;
   inspectFilesystem?: boolean;
 }): Promise<ExecutionWorkspaceReuseCompatibility> {
   const workspace = input.workspace;
@@ -5850,9 +5851,14 @@ export async function evaluateExecutionWorkspaceReuseCompatibility(input: {
     return { reusable: false, reason: "workspace_branch_lineage_mismatch" };
   }
   if (input.inspectFilesystem) {
+    const expectedRepoRoot = readNonEmptyString(input.expectedRepoRoot);
+    if (!expectedRepoRoot) {
+      return { reusable: false, reason: "workspace_base_repository_missing" };
+    }
     const inspection = await inspectManagedGitWorktreeBranch({
       worktreePath,
       expectedBranchName: branchName,
+      repoRoot: expectedRepoRoot,
     });
     if (!inspection.valid) {
       // A checked-out branch can still be a compatible forward descendant of
@@ -19494,6 +19500,7 @@ export function heartbeatService(
           expectedProjectWorkspaceId: executionWorkspaceBase.workspaceId,
           requestedExecutionWorkspaceMode,
           requestedBranchName: requestedExistingBranch,
+          expectedRepoRoot: executionWorkspaceBase.baseCwd,
           inspectFilesystem: true,
         });
         logger.info(

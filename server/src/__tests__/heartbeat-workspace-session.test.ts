@@ -2319,6 +2319,113 @@ describe("effective run execution workspace config freshness", () => {
     expect(realizeWorkspace).not.toHaveBeenCalled();
   });
 
+  it("refreshes or rejects a reusable-looking worktree from another repository", async () => {
+    const expectedRepository = await createLinkedGitWorktree();
+    const incompatibleRepository = await createLinkedGitWorktree();
+    const workspace = {
+      id: "workspace-old",
+      companyId: "company-1",
+      projectId: "project-1",
+      projectWorkspaceId: "workspace-1",
+      sourceIssueId: "issue-1",
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Incompatible isolated workspace",
+      status: "active",
+      deliveryState: "unmerged",
+      cwd: incompatibleRepository.worktreePath,
+      repoUrl: "https://example.invalid/repo.git",
+      baseRef: "master",
+      branchName: incompatibleRepository.branchName,
+      providerType: "git_worktree",
+      providerRef: incompatibleRepository.worktreePath,
+      derivedFromExecutionWorkspaceId: null,
+      lastUsedAt: new Date("2026-09-08T00:00:00.000Z"),
+      openedAt: new Date("2026-09-08T00:00:00.000Z"),
+      closedAt: null,
+      cleanupEligibleAt: null,
+      cleanupReason: null,
+      config: null,
+      metadata: null,
+      createdAt: new Date("2026-09-08T00:00:00.000Z"),
+      updatedAt: new Date("2026-09-08T00:00:00.000Z"),
+    } satisfies ExecutionWorkspace;
+
+    try {
+      const compatibility = await evaluateExecutionWorkspaceReuseCompatibility({
+        workspace,
+        expectedCompanyId: "company-1",
+        expectedProjectId: "project-1",
+        expectedProjectWorkspaceId: "workspace-1",
+        requestedExecutionWorkspaceMode: "isolated_workspace",
+        requestedBranchName: incompatibleRepository.branchName,
+        expectedRepoRoot: expectedRepository.baseCwd,
+        inspectFilesystem: true,
+      });
+      expect(compatibility).toEqual({
+        reusable: false,
+        reason: "workspace_worktree_unavailable:not_registered",
+      });
+
+      const metadata = buildWorkspaceConfigMetadata();
+      const decision = resolveExecutionWorkspaceConfigFreshness({
+        hasExistingWorkspace: compatibility.reusable,
+        existingWorkspaceMetadata: null,
+        nextMetadata: metadata,
+      });
+      const realizeWorkspace = vi.fn(async () => ({
+        id: "unexpected-fallback",
+        warnings: [],
+      }));
+      const realizeFreshWorkspace = vi.fn(async () => ({
+        id: "fresh-worktree",
+        warnings: [],
+      }));
+
+      await expect(provisionExecutionWorkspaceForFreshnessDecision({
+        requestedShouldReuseExisting: true,
+        existingExecutionWorkspaceId: workspace.id,
+        issueRef: { id: "issue-1", identifier: "PAP-42" },
+        runId: "run-1",
+        workspaceConfigFreshness: decision,
+        restoreExistingWorkspace: null,
+        realizeWorkspace,
+        allowFreshWorkspaceOnNonReusable: true,
+        workspaceNotReusableReason: compatibility.reason,
+        realizeFreshWorkspace,
+      })).resolves.toMatchObject({
+        executionWorkspace: { id: "fresh-worktree" },
+        reusedExecutionWorkspace: null,
+        policy: { shouldRestoreExistingWorkspace: false },
+      });
+      expect(realizeFreshWorkspace).toHaveBeenCalledOnce();
+      expect(realizeWorkspace).not.toHaveBeenCalled();
+
+      await expect(provisionExecutionWorkspaceForFreshnessDecision({
+        requestedShouldReuseExisting: true,
+        existingExecutionWorkspaceId: workspace.id,
+        issueRef: { id: "issue-1", identifier: "PAP-42" },
+        runId: "run-2",
+        workspaceConfigFreshness: decision,
+        restoreExistingWorkspace: null,
+        realizeWorkspace,
+        allowFreshWorkspaceOnNonReusable: false,
+        workspaceNotReusableReason: compatibility.reason,
+      })).rejects.toMatchObject({
+        code: "workspace_validation_failed",
+        resultJson: {
+          workspaceValidation: expect.objectContaining({
+            reason: "workspace_not_reusable",
+            invariant: "workspace_worktree_unavailable:not_registered",
+          }),
+        },
+      });
+    } finally {
+      await fs.rm(expectedRepository.root, { recursive: true, force: true });
+      await fs.rm(incompatibleRepository.root, { recursive: true, force: true });
+    }
+  });
+
   it("does not mistake a projectless native run-id binding for a missing persisted workspace", () => {
     expect(resolveNativeRecoveryExecutionWorkspaceBinding({
       bindingId: "run-projectless",
