@@ -32,7 +32,33 @@ export const projectExecutionWorkspacePolicySchema = z
     cleanupPolicy: z.record(z.string(), z.unknown()).optional().nullable(),
     authorizationPolicy: trustAuthorizationPolicySchema.optional().nullable(),
   })
-  .strict();
+  .strict()
+  .superRefine((policy, ctx) => {
+    if (
+      policy.enabled &&
+      policy.defaultMode === "adapter_default" &&
+      policy.workspaceStrategy?.type === "git_worktree"
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["defaultMode"],
+        message:
+          'defaultMode "adapter_default" resolves to mode "agent_default", which cannot apply workspaceStrategy "git_worktree". Change defaultMode to "isolated_workspace" to create worktrees, or clear the git_worktree strategy to keep adapter-managed execution.',
+        params: {
+          paperclipCode: "incoherent_execution_workspace_policy",
+          invariant: "adapter_default_cannot_use_git_worktree",
+          effectiveMode: "agent_default",
+          effectiveStrategy: "adapter_managed",
+          remediation:
+            'Set executionWorkspacePolicy.defaultMode to "isolated_workspace" to preserve git worktree isolation, or remove executionWorkspacePolicy.workspaceStrategy.',
+          recommendedAction: {
+            type: "update_project_execution_workspace_policy",
+            patch: { defaultMode: "isolated_workspace" },
+          },
+        },
+      });
+    }
+  });
 
 export const projectWorkspaceRuntimeConfigSchema = z.object({
   workspaceRuntime: z.record(z.string(), z.unknown()).optional().nullable(),

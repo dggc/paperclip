@@ -9,6 +9,40 @@ export function validate(schema: ZodSchema) {
   };
 }
 
+type ZodIssueWithParams = ZodIssue & {
+  params?: Record<string, unknown>;
+};
+
+export function validateProjectMutationBody(schema: ZodSchema) {
+  return (req: Request, _res: Response, next: NextFunction) => {
+    try {
+      req.body = schema.parse(req.body);
+    } catch (err) {
+      if (err instanceof ZodError) {
+        const incoherentPolicy = err.issues.find(
+          (issue) =>
+            (issue as ZodIssueWithParams).params?.paperclipCode ===
+            "incoherent_execution_workspace_policy",
+        ) as ZodIssueWithParams | undefined;
+        if (incoherentPolicy) {
+          const params = incoherentPolicy.params ?? {};
+          throw unprocessable("Incoherent execution workspace policy", {
+            code: "incoherent_execution_workspace_policy",
+            invariant: params.invariant,
+            effectiveMode: params.effectiveMode,
+            effectiveStrategy: params.effectiveStrategy,
+            remediation: params.remediation,
+            recommendedAction: params.recommendedAction,
+            issues: err.issues,
+          });
+        }
+      }
+      throw err;
+    }
+    next();
+  };
+}
+
 // The issue create/update contract requires HTTP 422 (not the generic Zod 400)
 // when a request pins an invalid executionWorkspaceSettings.workspaceStrategy
 // .existingBranch: bad branch syntax, placement outside isolated_workspace +

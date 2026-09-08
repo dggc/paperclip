@@ -93,6 +93,57 @@ function concurrencySelect(): HTMLSelectElement {
 }
 
 describe("ProjectProperties — shared workspace concurrency select", () => {
+  it("explains and safely migrates an incoherent adapter-default worktree policy", () => {
+    const onFieldUpdate = vi.fn();
+    render(
+      makeProject({
+        executionWorkspacePolicy: {
+          enabled: true,
+          defaultMode: "adapter_default",
+          workspaceStrategy: { type: "git_worktree" },
+        },
+      } as Partial<Project>),
+      onFieldUpdate,
+    );
+
+    expect(container.textContent).toContain(
+      "This workspace policy cannot create an isolated checkout.",
+    );
+    expect(container.textContent).toContain("Effective mode: agent_default");
+    expect(container.textContent).toContain("resolves to adapter_managed");
+    const migrateButton = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent === "Use isolated checkout",
+    );
+    if (!migrateButton) throw new Error("Safe migration button not found");
+    act(() => migrateButton.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+
+    expect(onFieldUpdate).toHaveBeenCalledWith(
+      "execution_workspace_default_mode",
+      expect.objectContaining({
+        executionWorkspacePolicy: expect.objectContaining({
+          defaultMode: "isolated_workspace",
+          workspaceStrategy: { type: "git_worktree" },
+        }),
+      }),
+    );
+  });
+
+  it("does not warn when adapter-default execution has no explicit worktree strategy", () => {
+    render(
+      makeProject({
+        executionWorkspacePolicy: {
+          enabled: true,
+          defaultMode: "adapter_default",
+        },
+      } as Partial<Project>),
+      vi.fn(),
+    );
+
+    expect(container.textContent).not.toContain(
+      "This workspace policy cannot create an isolated checkout.",
+    );
+  });
+
   it("defaults to Auto when the policy has no sharedWorkspaceConcurrency", () => {
     render(makeProject(), vi.fn());
     expect(concurrencySelect().value).toBe("auto");

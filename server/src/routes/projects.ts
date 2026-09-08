@@ -12,7 +12,7 @@ import {
 } from "@paperclipai/shared";
 import type { WorkspaceRuntimeDesiredState, WorkspaceRuntimeServiceStateMap } from "@paperclipai/shared";
 import { trackProjectCreated } from "@paperclipai/shared/telemetry";
-import { validate } from "../middleware/validate.js";
+import { validate, validateProjectMutationBody } from "../middleware/validate.js";
 import { accessService, projectService, logActivity, workspaceOperationService } from "../services/index.js";
 import { conflict, forbidden, unprocessable } from "../errors.js";
 import { externalObjectService } from "../services/external-objects.js";
@@ -186,7 +186,7 @@ export function projectRoutes(db: Db) {
     res.json(summary);
   });
 
-  router.post("/companies/:companyId/projects", validate(createProjectSchema), async (req, res) => {
+  router.post("/companies/:companyId/projects", validateProjectMutationBody(createProjectSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     type CreateProjectPayload = Parameters<typeof svc.create>[1] & {
@@ -255,7 +255,7 @@ export function projectRoutes(db: Db) {
     res.status(201).json(hydratedProject ?? project);
   });
 
-  router.patch("/projects/:id", validate(updateProjectSchema), async (req, res) => {
+  router.patch("/projects/:id", validateProjectMutationBody(updateProjectSchema), async (req, res) => {
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Project not found");
     if (!existing) return;

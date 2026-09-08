@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import {
   issueExecutionWorkspaceSettingsSchema,
   projectExecutionWorkspacePolicySchema,
+  updateProjectSchema,
 } from "@paperclipai/shared";
+import { validateProjectMutationBody } from "../middleware/validate.ts";
 import {
   buildExecutionWorkspaceAdapterConfig,
   defaultIssueExecutionWorkspaceSettingsForProject,
@@ -20,6 +22,60 @@ import {
 } from "../services/execution-workspace-policy.ts";
 
 describe("execution workspace policy helpers", () => {
+  it("rejects adapter-default git-worktree policies with typed recovery metadata", () => {
+    const parsed = projectExecutionWorkspacePolicySchema.safeParse({
+      enabled: true,
+      defaultMode: "adapter_default",
+      workspaceStrategy: { type: "git_worktree" },
+    });
+
+    expect(parsed.success).toBe(false);
+    if (parsed.success) throw new Error("Expected policy validation to fail");
+    expect(parsed.error.issues[0]).toMatchObject({
+      path: ["defaultMode"],
+      params: {
+        paperclipCode: "incoherent_execution_workspace_policy",
+        invariant: "adapter_default_cannot_use_git_worktree",
+        effectiveMode: "agent_default",
+        effectiveStrategy: "adapter_managed",
+        recommendedAction: {
+          type: "update_project_execution_workspace_policy",
+          patch: { defaultMode: "isolated_workspace" },
+        },
+      },
+    });
+
+    expect(() =>
+      validateProjectMutationBody(updateProjectSchema)(
+        {
+          body: {
+            executionWorkspacePolicy: {
+              enabled: true,
+              defaultMode: "adapter_default",
+              workspaceStrategy: { type: "git_worktree" },
+            },
+          },
+        } as never,
+        {} as never,
+        (() => undefined) as never,
+      ),
+    ).toThrowError(
+      expect.objectContaining({
+        status: 422,
+        details: expect.objectContaining({
+          code: "incoherent_execution_workspace_policy",
+          invariant: "adapter_default_cannot_use_git_worktree",
+          effectiveMode: "agent_default",
+          effectiveStrategy: "adapter_managed",
+          recommendedAction: {
+            type: "update_project_execution_workspace_policy",
+            patch: { defaultMode: "isolated_workspace" },
+          },
+        }),
+      }),
+    );
+  });
+
   it("defaults new issue settings from enabled project policy", () => {
     expect(
       defaultIssueExecutionWorkspaceSettingsForProject({

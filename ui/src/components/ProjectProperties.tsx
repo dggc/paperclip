@@ -340,6 +340,10 @@ export function ProjectProperties({ project, onUpdate, onFieldUpdate, getFieldSa
     branchTemplate: "",
     worktreeParentDir: "",
   };
+  const incoherentAdapterDefaultWorktreePolicy =
+    executionWorkspacesEnabled &&
+    executionWorkspacePolicy?.defaultMode === "adapter_default" &&
+    executionWorkspacePolicy.workspaceStrategy?.type === "git_worktree";
   // Defense in depth alongside the server's managed-sandbox-only read
   // filter: a cached environments list may still carry the local row.
   const managedSandboxOnly = experimentalSettings?.enableManagedSandboxOnly === true;
@@ -1037,6 +1041,33 @@ export function ProjectProperties({ project, onUpdate, onFieldUpdate, getFieldSa
 
                 {executionWorkspacesEnabled ? (
                   <div className="space-y-3">
+                    {incoherentAdapterDefaultWorktreePolicy ? (
+                      <div className="space-y-2 rounded-md border border-destructive/40 bg-destructive/5 p-3">
+                        <p className="text-xs font-medium text-destructive">
+                          This workspace policy cannot create an isolated checkout.
+                        </p>
+                        <p className="text-(length:--text-micro) text-muted-foreground">
+                          Effective mode: <span className="font-mono text-foreground">agent_default</span>. Configured strategy: <span className="font-mono text-foreground">git_worktree</span>, but adapter-default execution ignores it and resolves to <span className="font-mono text-foreground">adapter_managed</span>.
+                        </p>
+                        {onUpdate || onFieldUpdate ? (
+                          <Button
+                            variant="outline"
+                            size="xs"
+                            onClick={() =>
+                              commitField(
+                                "execution_workspace_default_mode",
+                                updateExecutionWorkspacePolicy({ defaultMode: "isolated_workspace" })!,
+                              )}
+                          >
+                            Use isolated checkout
+                          </Button>
+                        ) : (
+                          <p className="text-(length:--text-micro) text-muted-foreground">
+                            Set the default mode to isolated workspace to preserve the Git worktree strategy.
+                          </p>
+                        )}
+                      </div>
+                    ) : null}
                     <div className="flex items-center justify-between gap-3">
                       <div className="space-y-0.5">
                         <div className="flex items-center gap-2 text-sm">

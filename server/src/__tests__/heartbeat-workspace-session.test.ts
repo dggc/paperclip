@@ -5,19 +5,23 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it, vi } from "vitest";
 import type { agents } from "@paperclipai/db";
+import type { ExecutionWorkspace } from "@paperclipai/shared";
 import { sessionCodec as codexSessionCodec } from "@paperclipai/adapter-codex-local/server";
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
 import {
   applyPersistedExecutionWorkspaceConfig,
+  assertExecutionWorkspacePolicyCoherent,
   assertGitSensitiveAdapterWorkspaceValid,
   assertGitWorktreeBaseWorkspaceReady,
   assertPushCapabilityCheckoutValid,
+  assertRepositoryBoundIsolatedWorkspaceValid,
   buildExplicitResumeSessionOverride,
   buildEffectiveRunSessionConfigMetadata,
   buildEffectiveRunWorkspaceConfigMetadata,
   buildWorkspaceConfigFreshnessOperation,
   deriveTaskKeyWithHeartbeatFallback,
   extractWakeCommentIds,
+  evaluateExecutionWorkspaceReuseCompatibility,
   formatRuntimeWorkspaceWarningLog,
   mergeExecutionWorkspaceMetadataForPersistence,
   mergeCoalescedContextSnapshot,
@@ -142,6 +146,23 @@ async function createGitCheckout(options: { withRemote: boolean }) {
     await runGit(root, ["remote", "add", "origin", "https://github.com/example/repo.git"]);
   }
   return root;
+}
+
+async function createLinkedGitWorktree() {
+  const root = await fs.mkdtemp(
+    path.join(os.tmpdir(), "paperclip-isolated-workspace-"),
+  );
+  const baseCwd = path.join(root, "base");
+  const worktreePath = path.join(root, "worktree");
+  await fs.mkdir(baseCwd);
+  await runGit(baseCwd, ["init"]);
+  await runGit(baseCwd, ["config", "user.name", "Paperclip Test"]);
+  await runGit(baseCwd, ["config", "user.email", "test@paperclip.local"]);
+  await fs.writeFile(path.join(baseCwd, "README.md"), "fixture\n", "utf8");
+  await runGit(baseCwd, ["add", "README.md"]);
+  await runGit(baseCwd, ["commit", "-m", "fixture"]);
+  await runGit(baseCwd, ["worktree", "add", "-b", "PAP-1-isolated", worktreePath]);
+  return { root, baseCwd, worktreePath, branchName: "PAP-1-isolated" };
 }
 
 async function expectWorkspaceValidationFailure(
@@ -458,6 +479,488 @@ describe("assertGitSensitiveAdapterWorkspaceValid", () => {
         }),
       ),
     ).resolves.toBeUndefined();
+  });
+});
+
+describe("isolated workspace launch invariants", () => {
+  it("fails legacy incoherent project policies before adapter launch", () => {
+    expect(() =>
+      assertExecutionWorkspacePolicyCoherent({
+        policy: {
+          enabled: true,
+          defaultMode: "adapter_default",
+          workspaceStrategy: { type: "git_worktree" },
+        },
+        issue: { id: "issue-1", identifier: "PAP-1" },
+      }),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "workspace_validation_failed",
+        resultJson: {
+          workspaceValidation: expect.objectContaining({
+            reason: "incoherent_execution_workspace_policy",
+            invariant: "adapter_default_cannot_use_git_worktree",
+            effectiveMode: "agent_default",
+            effectiveStrategy: "adapter_managed",
+            recommendedAction: {
+              type: "update_project_execution_workspace_policy",
+              patch: { defaultMode: "isolated_workspace" },
+            },
+          }),
+        },
+      }),
+    );
+  });
+
+  it("accepts only a distinct active worktree with matching project identity and branch", async () => {
+    const fixture = await createLinkedGitWorktree();
+    const persistedExecutionWorkspace: ExecutionWorkspace = {
+      id: "execution-workspace-1",
+      companyId: "company-1",
+      projectId: "project-1",
+      projectWorkspaceId: "workspace-1",
+      sourceIssueId: "issue-1",
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Isolated workspace",
+      status: "active",
+      deliveryState: "unmerged",
+      cwd: fixture.worktreePath,
+      repoUrl: "https://example.invalid/repo.git",
+      baseRef: "master",
+      branchName: fixture.branchName,
+      providerType: "git_worktree",
+      providerRef: fixture.worktreePath,
+      derivedFromExecutionWorkspaceId: null,
+      lastUsedAt: new Date("2026-09-08T00:00:00.000Z"),
+      openedAt: new Date("2026-09-08T00:00:00.000Z"),
+      closedAt: null,
+      cleanupEligibleAt: null,
+      cleanupReason: null,
+      config: null,
+      metadata: null,
+      createdAt: new Date("2026-09-08T00:00:00.000Z"),
+      updatedAt: new Date("2026-09-08T00:00:00.000Z"),
+    };
+    const input = {
+      requestedExecutionWorkspaceMode: "isolated_workspace" as const,
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-1",
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        executionWorkspacePreference: "reuse_existing",
+      },
+      resolvedWorkspace: buildResolvedWorkspace({
+        cwd: fixture.baseCwd,
+        repoUrl: "https://example.invalid/repo.git",
+      }),
+      executionWorkspace: {
+        baseCwd: fixture.baseCwd,
+        source: "issue",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: "https://example.invalid/repo.git",
+        repoRef: "master",
+        strategy: "git_worktree" as const,
+        cwd: fixture.worktreePath,
+        branchName: fixture.branchName,
+        worktreePath: fixture.worktreePath,
+        warnings: [],
+        created: false,
+        baseRefSha: null,
+      },
+      persistedExecutionWorkspace,
+    };
+
+    try {
+      await expect(
+        assertRepositoryBoundIsolatedWorkspaceValid(input),
+      ).resolves.toBeUndefined();
+
+      await expect(
+        assertRepositoryBoundIsolatedWorkspaceValid({
+          ...input,
+          persistedExecutionWorkspace: {
+            ...persistedExecutionWorkspace,
+            status: "archived",
+          },
+        }),
+      ).rejects.toMatchObject({
+        code: "workspace_validation_failed",
+        resultJson: {
+          workspaceValidation: expect.objectContaining({
+            reason: "workspace_not_reusable",
+            recommendedAction: expect.objectContaining({
+              type: "create_fresh_isolated_worktree",
+            }),
+          }),
+        },
+      });
+
+      const primaryAlias = path.join(fixture.root, "primary-alias");
+      await fs.symlink(fixture.baseCwd, primaryAlias, "dir");
+      await expect(
+        assertRepositoryBoundIsolatedWorkspaceValid({
+          ...input,
+          executionWorkspace: {
+            ...input.executionWorkspace,
+            cwd: primaryAlias,
+            branchName: "master",
+            worktreePath: primaryAlias,
+          },
+          persistedExecutionWorkspace: {
+            ...persistedExecutionWorkspace,
+            cwd: primaryAlias,
+            branchName: "master",
+            providerRef: primaryAlias,
+          },
+        }),
+      ).rejects.toMatchObject({
+        resultJson: {
+          workspaceValidation: expect.objectContaining({
+            reason: "isolated_workspace_path_fallback",
+          }),
+        },
+      });
+
+      await expect(
+        assertRepositoryBoundIsolatedWorkspaceValid({
+          ...input,
+          executionWorkspace: {
+            ...input.executionWorkspace,
+            cwd: fixture.baseCwd,
+          },
+        }),
+      ).rejects.toMatchObject({
+        resultJson: {
+          workspaceValidation: expect.objectContaining({
+            reason: "isolated_workspace_path_fallback",
+          }),
+        },
+      });
+
+      const invariantCases = [
+        {
+          name: "resolved mode",
+          patch: {
+            requestedExecutionWorkspaceMode: "agent_default" as const,
+          },
+          reason: "isolated_workspace_mode_mismatch",
+        },
+        {
+          name: "strategy",
+          patch: {
+            executionWorkspace: {
+              ...input.executionWorkspace,
+              strategy: "project_primary" as const,
+            },
+          },
+          reason: "isolated_workspace_strategy_mismatch",
+        },
+        {
+          name: "project workspace identity",
+          patch: {
+            persistedExecutionWorkspace: {
+              ...persistedExecutionWorkspace,
+              projectWorkspaceId: "workspace-2",
+            },
+          },
+          reason: "isolated_workspace_project_identity_mismatch",
+        },
+        {
+          name: "worktree path",
+          patch: {
+            executionWorkspace: {
+              ...input.executionWorkspace,
+              worktreePath: null,
+            },
+            persistedExecutionWorkspace: {
+              ...persistedExecutionWorkspace,
+              providerRef: null,
+            },
+          },
+          reason: "isolated_workspace_worktree_path_missing",
+        },
+        {
+          name: "branch",
+          patch: {
+            executionWorkspace: {
+              ...input.executionWorkspace,
+              branchName: null,
+            },
+            persistedExecutionWorkspace: {
+              ...persistedExecutionWorkspace,
+              branchName: null,
+            },
+          },
+          reason: "isolated_workspace_branch_missing",
+        },
+      ];
+      for (const invariantCase of invariantCases) {
+        await expect(
+          assertRepositoryBoundIsolatedWorkspaceValid({
+            ...input,
+            ...invariantCase.patch,
+          }),
+          invariantCase.name,
+        ).rejects.toMatchObject({
+          resultJson: {
+            workspaceValidation: expect.objectContaining({
+              reason: invariantCase.reason,
+              recommendedAction: expect.objectContaining({
+                type: "create_fresh_isolated_worktree",
+              }),
+            }),
+          },
+        });
+      }
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("detects a local-path Git repository even when repo metadata is absent", async () => {
+    const baseCwd = await createGitCheckout({ withRemote: false });
+    try {
+      await expect(
+        assertRepositoryBoundIsolatedWorkspaceValid({
+          requestedExecutionWorkspaceMode: "isolated_workspace",
+          issue: {
+            id: "issue-1",
+            identifier: "PAP-1",
+            projectId: "project-1",
+            projectWorkspaceId: "workspace-1",
+            executionWorkspacePreference: "isolated_workspace",
+          },
+          resolvedWorkspace: buildResolvedWorkspace({
+            cwd: baseCwd,
+            repoUrl: null,
+          }),
+          executionWorkspace: {
+            baseCwd,
+            source: "project_primary",
+            projectId: "project-1",
+            workspaceId: "workspace-1",
+            repoUrl: null,
+            repoRef: null,
+            strategy: "project_primary",
+            cwd: baseCwd,
+            branchName: null,
+            worktreePath: null,
+            warnings: [],
+            created: false,
+            baseRefSha: null,
+          },
+          persistedExecutionWorkspace: null,
+        }),
+      ).rejects.toMatchObject({
+        resultJson: {
+          workspaceValidation: expect.objectContaining({
+            reason: "isolated_workspace_missing_persisted_workspace",
+          }),
+        },
+      });
+    } finally {
+      await fs.rm(baseCwd, { recursive: true, force: true });
+    }
+  });
+
+  it("classifies reusable workspace lifecycle and lineage without fallback", async () => {
+    const workspace = {
+      id: "execution-workspace-1",
+      companyId: "company-1",
+      projectId: "project-1",
+      projectWorkspaceId: "workspace-1",
+      sourceIssueId: "issue-1",
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Isolated workspace",
+      status: "active",
+      deliveryState: "unmerged",
+      cwd: "/tmp/worktree",
+      repoUrl: "https://example.invalid/repo.git",
+      baseRef: "master",
+      branchName: "PAP-1-isolated",
+      providerType: "git_worktree",
+      providerRef: "/tmp/worktree",
+      derivedFromExecutionWorkspaceId: null,
+      lastUsedAt: new Date("2026-09-08T00:00:00.000Z"),
+      openedAt: new Date("2026-09-08T00:00:00.000Z"),
+      closedAt: null,
+      cleanupEligibleAt: null,
+      cleanupReason: null,
+      config: null,
+      metadata: null,
+      createdAt: new Date("2026-09-08T00:00:00.000Z"),
+      updatedAt: new Date("2026-09-08T00:00:00.000Z"),
+    } satisfies ExecutionWorkspace;
+    const expected = {
+      expectedCompanyId: "company-1",
+      expectedProjectId: "project-1",
+      expectedProjectWorkspaceId: "workspace-1",
+      requestedExecutionWorkspaceMode: "isolated_workspace" as const,
+      requestedBranchName: "PAP-1-isolated",
+      inspectFilesystem: false,
+    };
+
+    await expect(
+      evaluateExecutionWorkspaceReuseCompatibility({ workspace, ...expected }),
+    ).resolves.toEqual({ reusable: true, reason: null });
+    await expect(
+      evaluateExecutionWorkspaceReuseCompatibility({
+        workspace: { ...workspace, deliveryState: "merged_via_pr" },
+        ...expected,
+      }),
+    ).resolves.toEqual({
+      reusable: false,
+      reason: "workspace_merged:merged_via_pr",
+    });
+    await expect(
+      evaluateExecutionWorkspaceReuseCompatibility({
+        workspace: { ...workspace, projectWorkspaceId: "workspace-2" },
+        ...expected,
+      }),
+    ).resolves.toEqual({
+      reusable: false,
+      reason: "workspace_project_workspace_mismatch",
+    });
+    await expect(
+      evaluateExecutionWorkspaceReuseCompatibility({
+        workspace: { ...workspace, branchName: "PAP-1-other" },
+        ...expected,
+      }),
+    ).resolves.toEqual({
+      reusable: false,
+      reason: "workspace_branch_lineage_mismatch",
+    });
+
+    await expect(
+      evaluateExecutionWorkspaceReuseCompatibility({
+        workspace: {
+          ...workspace,
+          mode: "operator_branch",
+          strategyType: "project_primary",
+          providerType: "local_fs",
+          providerRef: null,
+          branchName: null,
+        },
+        ...expected,
+        requestedExecutionWorkspaceMode: "operator_branch",
+        requestedBranchName: null,
+      }),
+    ).resolves.toEqual({ reusable: true, reason: null });
+    await expect(
+      evaluateExecutionWorkspaceReuseCompatibility({
+        workspace: {
+          ...workspace,
+          mode: "shared_workspace",
+          strategyType: "project_primary",
+          providerType: "local_fs",
+          providerRef: null,
+          branchName: null,
+        },
+        ...expected,
+        requestedExecutionWorkspaceMode: "shared_workspace",
+        requestedBranchName: null,
+      }),
+    ).resolves.toEqual({ reusable: true, reason: null });
+    await expect(
+      evaluateExecutionWorkspaceReuseCompatibility({
+        workspace: {
+          ...workspace,
+          mode: "shared_workspace",
+          strategyType: "project_primary",
+          providerType: "local_fs",
+          providerRef: null,
+          branchName: null,
+        },
+        ...expected,
+        requestedExecutionWorkspaceMode: "operator_branch",
+        requestedBranchName: null,
+      }),
+    ).resolves.toEqual({
+      reusable: false,
+      reason: "workspace_mode_incompatible:shared_workspace",
+    });
+    await expect(
+      evaluateExecutionWorkspaceReuseCompatibility({
+        workspace: {
+          ...workspace,
+          mode: "shared_workspace",
+          strategyType: "adapter_managed",
+          providerType: "adapter_managed",
+          providerRef: null,
+          branchName: null,
+        },
+        ...expected,
+        requestedExecutionWorkspaceMode: "shared_workspace",
+        requestedBranchName: null,
+      }),
+    ).resolves.toEqual({
+      reusable: false,
+      reason: "workspace_strategy_incompatible",
+    });
+  });
+
+  it("reuses active compatible operator-branch and shared workspaces", async () => {
+    const workspaceCwd = await fs.mkdtemp(
+      path.join(os.tmpdir(), "paperclip-reusable-primary-workspace-"),
+    );
+    const workspace = {
+      id: "execution-workspace-1",
+      companyId: "company-1",
+      projectId: "project-1",
+      projectWorkspaceId: "workspace-1",
+      sourceIssueId: "issue-1",
+      mode: "shared_workspace",
+      strategyType: "project_primary",
+      name: "Primary workspace",
+      status: "active",
+      deliveryState: "unmerged",
+      cwd: workspaceCwd,
+      repoUrl: "https://example.invalid/repo.git",
+      baseRef: "master",
+      branchName: null,
+      providerType: "local_fs",
+      providerRef: null,
+      derivedFromExecutionWorkspaceId: null,
+      lastUsedAt: new Date("2026-09-08T00:00:00.000Z"),
+      openedAt: new Date("2026-09-08T00:00:00.000Z"),
+      closedAt: null,
+      cleanupEligibleAt: null,
+      cleanupReason: null,
+      config: null,
+      metadata: null,
+      createdAt: new Date("2026-09-08T00:00:00.000Z"),
+      updatedAt: new Date("2026-09-08T00:00:00.000Z"),
+    } satisfies ExecutionWorkspace;
+    const expected = {
+      expectedCompanyId: "company-1",
+      expectedProjectId: "project-1",
+      expectedProjectWorkspaceId: "workspace-1",
+      requestedBranchName: null,
+      inspectFilesystem: true,
+    };
+
+    try {
+      await expect(
+        evaluateExecutionWorkspaceReuseCompatibility({
+          workspace,
+          ...expected,
+          requestedExecutionWorkspaceMode: "shared_workspace",
+        }),
+      ).resolves.toEqual({ reusable: true, reason: null });
+      await expect(
+        evaluateExecutionWorkspaceReuseCompatibility({
+          workspace: { ...workspace, mode: "operator_branch" },
+          ...expected,
+          requestedExecutionWorkspaceMode: "operator_branch",
+        }),
+      ).resolves.toEqual({ reusable: true, reason: null });
+    } finally {
+      await fs.rm(workspaceCwd, { recursive: true, force: true });
+    }
   });
 });
 
@@ -1707,14 +2210,67 @@ describe("effective run execution workspace config freshness", () => {
         throw new Error("restore command failed");
       },
       realizeWorkspace,
-    })).rejects.toThrow(/restore command failed/);
+    })).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          reason: "workspace_not_reusable",
+          recommendedAction: expect.objectContaining({
+            type: "create_fresh_isolated_worktree",
+          }),
+        }),
+      },
+    });
+    expect(realizeWorkspace).not.toHaveBeenCalled();
+  });
+
+  it("does not replace a compatible workspace after an unrelated restore failure", async () => {
+    const metadata = buildWorkspaceConfigMetadata();
+    const decision = resolveExecutionWorkspaceConfigFreshness({
+      hasExistingWorkspace: true,
+      existingWorkspaceMetadata: persistedWorkspaceConfigFingerprint(metadata),
+      nextMetadata: metadata,
+    });
+    const realizeWorkspace = vi.fn(async () => ({
+      id: "fallback-workspace",
+      warnings: [],
+    }));
+    const realizeFreshWorkspace = vi.fn(async () => ({
+      id: "fresh-workspace",
+      warnings: [],
+    }));
+
+    await expect(
+      provisionExecutionWorkspaceForFreshnessDecision({
+        requestedShouldReuseExisting: true,
+        existingExecutionWorkspaceId: "workspace-old",
+        issueRef: { id: "issue-1", identifier: "PAP-42" },
+        runId: "run-1",
+        workspaceConfigFreshness: decision,
+        restoreExistingWorkspace: async () => {
+          throw new Error("provision command failed");
+        },
+        realizeWorkspace,
+        allowFreshWorkspaceOnNonReusable: true,
+        workspaceNotReusableReason: null,
+        realizeFreshWorkspace,
+      }),
+    ).rejects.toMatchObject({
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          reason: "workspace_not_reusable",
+          invariant: "workspace_restore_failed",
+        }),
+      },
+    });
+    expect(realizeFreshWorkspace).not.toHaveBeenCalled();
     expect(realizeWorkspace).not.toHaveBeenCalled();
   });
 
   it.each([
     { name: "missing", status: null },
     { name: "archived", status: "archived" },
-  ])("fails loudly when the inherited workspace row is $name", async ({ status }) => {
+  ])("creates a fresh worktree when the inherited workspace row is $name", async ({ status }) => {
     const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
       issueExecutionWorkspaceId: "workspace-old",
       issueExecutionWorkspacePreference: "reuse_existing",
@@ -1735,8 +2291,9 @@ describe("effective run execution workspace config freshness", () => {
       nextMetadata: metadata,
     });
     const realizeWorkspace = vi.fn(async () => ({ id: "fallback-workspace", warnings: [] }));
+    const realizeFreshWorkspace = vi.fn(async () => ({ id: "fresh-worktree", warnings: [] }));
 
-    await expect(provisionExecutionWorkspaceForFreshnessDecision({
+    const result = await provisionExecutionWorkspaceForFreshnessDecision({
       requestedShouldReuseExisting: reuseRequest.requestedShouldReuseExisting,
       existingExecutionWorkspaceId: reuseRequest.requestedExecutionWorkspaceId,
       issueRef: { id: "issue-1", identifier: "PAP-42" },
@@ -1746,7 +2303,19 @@ describe("effective run execution workspace config freshness", () => {
         ? async () => ({ id: "workspace-old", warnings: [] })
         : null,
       realizeWorkspace,
-    })).rejects.toThrow(/could not be restored/);
+      allowFreshWorkspaceOnNonReusable: true,
+      workspaceNotReusableReason: status
+        ? `workspace_not_active:${status}`
+        : "workspace_missing",
+      realizeFreshWorkspace,
+    });
+
+    expect(result).toMatchObject({
+      executionWorkspace: { id: "fresh-worktree" },
+      reusedExecutionWorkspace: null,
+      policy: { shouldRestoreExistingWorkspace: false },
+    });
+    expect(realizeFreshWorkspace).toHaveBeenCalledOnce();
     expect(realizeWorkspace).not.toHaveBeenCalled();
   });
 
@@ -1837,7 +2406,18 @@ describe("effective run execution workspace config freshness", () => {
       workspaceConfigFreshness: decision,
       restoreExistingWorkspace: async () => null,
       realizeWorkspace,
-    })).rejects.toThrow(/could not be restored/);
+    })).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          reason: "workspace_not_reusable",
+          invariant: "workspace_restore_failed",
+          recommendedAction: expect.objectContaining({
+            type: "create_fresh_isolated_worktree",
+          }),
+        }),
+      },
+    });
     expect(realizeWorkspace).not.toHaveBeenCalled();
   });
 

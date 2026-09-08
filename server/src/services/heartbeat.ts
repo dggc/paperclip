@@ -47,6 +47,7 @@ import {
   type RoutineRevisionSnapshotV1,
   type RunLivenessState,
   type SourceTrustMetadata,
+  type ProjectExecutionWorkspacePolicy,
 } from "@paperclipai/shared";
 import {
   agents,
@@ -2528,14 +2529,25 @@ async function isGitCheckout(cwd: string | null | undefined) {
     .catch(() => false);
 }
 
-function sameResolvedPath(
+async function sameResolvedPath(
   left: string | null | undefined,
   right: string | null | undefined,
 ) {
   const leftPath = readNonEmptyString(left);
   const rightPath = readNonEmptyString(right);
   if (!leftPath || !rightPath) return false;
-  return path.resolve(leftPath) === path.resolve(rightPath);
+  const canonicalize = async (value: string) => {
+    const resolved = path.resolve(value);
+    return fs
+      .realpath(resolved)
+      .then((realPath) => path.resolve(realPath))
+      .catch(() => resolved);
+  };
+  const [canonicalLeft, canonicalRight] = await Promise.all([
+    canonicalize(leftPath),
+    canonicalize(rightPath),
+  ]);
+  return canonicalLeft === canonicalRight;
 }
 
 async function hasGitPushRemote(cwd: string | null | undefined) {
@@ -2719,6 +2731,221 @@ export function reconcileReusedExecutionWorkspaceProjectWorkspaceId(
   return existingProjectWorkspaceId ?? resolvedProjectWorkspaceId ?? null;
 }
 
+export function assertExecutionWorkspacePolicyCoherent(input: {
+  policy: ProjectExecutionWorkspacePolicy | null;
+  issue: { id: string; identifier: string | null } | null;
+}) {
+  const policy = input.policy;
+  if (
+    !policy?.enabled ||
+    policy.defaultMode !== "adapter_default" ||
+    policy.workspaceStrategy?.type !== "git_worktree"
+  ) {
+    return;
+  }
+
+  const remediation =
+    'Set executionWorkspacePolicy.defaultMode to "isolated_workspace" to preserve git worktree isolation, or remove executionWorkspacePolicy.workspaceStrategy to keep adapter-managed execution.';
+  throw new WorkspaceValidationFailure(
+    `Issue ${input.issue?.identifier ?? input.issue?.id ?? "run"} cannot launch because adapter_default resolves to agent_default and ignores the configured git_worktree strategy. ${remediation}`,
+    {
+      workspaceValidation: {
+        reason: "incoherent_execution_workspace_policy",
+        invariant: "adapter_default_cannot_use_git_worktree",
+        issueId: input.issue?.id ?? null,
+        issueIdentifier: input.issue?.identifier ?? null,
+        effectiveMode: "agent_default",
+        effectiveStrategy: "adapter_managed",
+        remediation,
+        recommendedAction: {
+          type: "update_project_execution_workspace_policy",
+          patch: { defaultMode: "isolated_workspace" },
+        },
+      },
+    },
+  );
+}
+
+export async function assertRepositoryBoundIsolatedWorkspaceValid(input: {
+  requestedExecutionWorkspaceMode: ReturnType<typeof resolveExecutionWorkspaceMode>;
+  issue: {
+    id: string;
+    identifier: string | null;
+    projectId: string | null;
+    projectWorkspaceId: string | null;
+    executionWorkspacePreference?: string | null;
+  } | null;
+  resolvedWorkspace: ResolvedWorkspaceForRun;
+  executionWorkspace: RealizedExecutionWorkspace;
+  persistedExecutionWorkspace: ExecutionWorkspace | null;
+}) {
+  const issue = input.issue;
+  if (!issue) return;
+  const repositoryBound =
+    Boolean(
+      input.resolvedWorkspace.repoUrl ||
+        input.executionWorkspace.repoUrl ||
+        input.executionWorkspace.strategy === "git_worktree" ||
+        input.persistedExecutionWorkspace?.providerType === "git_worktree",
+    ) ||
+    (await isGitCheckout(input.resolvedWorkspace.cwd)) ||
+    (await isGitCheckout(input.executionWorkspace.cwd));
+  const isolatedWorkRequired =
+    input.requestedExecutionWorkspaceMode === "isolated_workspace" ||
+    (issue.executionWorkspacePreference === "reuse_existing" &&
+      input.persistedExecutionWorkspace?.mode === "isolated_workspace");
+  if (!repositoryBound || !isolatedWorkRequired) return;
+
+  const remediation =
+    "Create a fresh isolated_workspace using the project's git_worktree strategy, then retry the run.";
+  const fail = (
+    reason: string,
+    invariant: string,
+    extra: Record<string, unknown> = {},
+  ): never => {
+    throw new WorkspaceValidationFailure(
+      `Issue ${issue.identifier ?? issue.id} cannot launch: ${invariant}. ${remediation}`,
+      {
+        workspaceValidation: {
+          reason,
+          invariant,
+          remediation,
+          recommendedAction: {
+            type: "create_fresh_isolated_worktree",
+            requiredMode: "isolated_workspace",
+            requiredStrategy: "git_worktree",
+          },
+          issueId: issue.id,
+          issueIdentifier: issue.identifier,
+          requestedExecutionWorkspaceMode:
+            input.requestedExecutionWorkspaceMode,
+          executionWorkspaceStrategy: input.executionWorkspace.strategy,
+          executionWorkspaceId: input.persistedExecutionWorkspace?.id ?? null,
+          ...extra,
+        },
+      },
+    );
+  };
+
+  if (input.requestedExecutionWorkspaceMode !== "isolated_workspace") {
+    fail(
+      "isolated_workspace_mode_mismatch",
+      `resolved mode is ${input.requestedExecutionWorkspaceMode}, expected isolated_workspace`,
+    );
+  }
+  const persistedExecutionWorkspace = input.persistedExecutionWorkspace;
+  if (!persistedExecutionWorkspace) {
+    return fail(
+      "isolated_workspace_missing_persisted_workspace",
+      "no isolated execution workspace was persisted",
+    );
+  }
+  if (
+    input.executionWorkspace.strategy !== "git_worktree" ||
+    persistedExecutionWorkspace.strategyType !== "git_worktree" ||
+    persistedExecutionWorkspace.providerType !== "git_worktree"
+  ) {
+    fail(
+      "isolated_workspace_strategy_mismatch",
+      "resolved and persisted strategies must both be git_worktree",
+    );
+  }
+  if (
+    persistedExecutionWorkspace.status !== "active" ||
+    persistedExecutionWorkspace.closedAt ||
+    persistedExecutionWorkspace.deliveryState === "merged_via_pr" ||
+    persistedExecutionWorkspace.deliveryState === "merged_by_ancestry"
+  ) {
+    fail(
+      "workspace_not_reusable",
+      "the persisted workspace lifecycle is not active and reusable",
+      {
+        workspaceStatus: persistedExecutionWorkspace.status,
+        workspaceDeliveryState: persistedExecutionWorkspace.deliveryState,
+        workspaceClosedAt:
+          persistedExecutionWorkspace.closedAt?.toISOString() ?? null,
+      },
+    );
+  }
+
+  const expectedProjectId = input.resolvedWorkspace.projectId ?? issue.projectId;
+  const expectedProjectWorkspaceId =
+    input.resolvedWorkspace.workspaceId ?? issue.projectWorkspaceId;
+  if (
+    !expectedProjectId ||
+    !expectedProjectWorkspaceId ||
+    (issue.projectId !== null && issue.projectId !== expectedProjectId) ||
+    (issue.projectWorkspaceId !== null &&
+      issue.projectWorkspaceId !== expectedProjectWorkspaceId) ||
+    input.executionWorkspace.projectId !== expectedProjectId ||
+    input.executionWorkspace.workspaceId !== expectedProjectWorkspaceId ||
+    persistedExecutionWorkspace.projectId !== expectedProjectId ||
+    persistedExecutionWorkspace.projectWorkspaceId !==
+      expectedProjectWorkspaceId
+  ) {
+    fail(
+      "isolated_workspace_project_identity_mismatch",
+      "the isolated workspace does not match the resolved project workspace identity",
+      { expectedProjectId, expectedProjectWorkspaceId },
+    );
+  }
+
+  const worktreePath =
+    readNonEmptyString(persistedExecutionWorkspace.providerRef) ??
+    readNonEmptyString(input.executionWorkspace.worktreePath);
+  const branchName =
+    readNonEmptyString(input.executionWorkspace.branchName) ??
+    readNonEmptyString(persistedExecutionWorkspace.branchName);
+  const requiredWorktreePath =
+    worktreePath ??
+    fail(
+      "isolated_workspace_worktree_path_missing",
+      "the isolated workspace has no worktree path",
+    );
+  const requiredBranchName =
+    branchName ??
+    fail(
+      "isolated_workspace_branch_missing",
+      "the isolated workspace has no branch",
+    );
+  if (
+    (await sameResolvedPath(
+      requiredWorktreePath,
+      input.executionWorkspace.baseCwd,
+    )) ||
+    !(await sameResolvedPath(
+      requiredWorktreePath,
+      input.executionWorkspace.cwd,
+    ))
+  ) {
+    fail(
+      "isolated_workspace_path_fallback",
+      "the adapter cwd is not the distinct isolated worktree path",
+      {
+        worktreePath: requiredWorktreePath,
+        executionWorkspaceCwd: input.executionWorkspace.cwd,
+      },
+    );
+  }
+  const inspection = await inspectManagedGitWorktreeBranch({
+    worktreePath: requiredWorktreePath,
+    expectedBranchName: requiredBranchName,
+    repoRoot: input.executionWorkspace.baseCwd,
+  });
+  if (!inspection.valid) {
+    fail(
+      "workspace_not_reusable",
+      `the worktree path or branch is not reusable (${inspection.reasonCode ?? "invalid"})`,
+      {
+        worktreePath: requiredWorktreePath,
+        branchName: requiredBranchName,
+        managedGitWorktreeBranch:
+          formatManagedGitWorktreeBranchInspection(inspection),
+      },
+    );
+  }
+}
+
 export async function assertGitSensitiveAdapterWorkspaceValid(input: {
   adapterType: string;
   agentId: string;
@@ -2830,7 +3057,7 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
     input.persistedExecutionWorkspace &&
     effectiveCwd &&
     persistedCwd &&
-    !sameResolvedPath(effectiveCwd, persistedCwd)
+    !(await sameResolvedPath(effectiveCwd, persistedCwd))
   ) {
     fail(
       "persisted_cwd_mismatch",
@@ -2866,7 +3093,7 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
   if (
     workspaceExpectation &&
     effectiveCwd &&
-    sameResolvedPath(effectiveCwd, agentFallbackCwd)
+    (await sameResolvedPath(effectiveCwd, agentFallbackCwd))
   ) {
     fail(
       "fallback_agent_home_cwd",
@@ -2878,10 +3105,10 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
     input.persistedExecutionWorkspace?.strategyType === "git_worktree" &&
     input.persistedExecutionWorkspace.providerRef &&
     effectiveCwd &&
-    !sameResolvedPath(
+    !(await sameResolvedPath(
       effectiveCwd,
       input.persistedExecutionWorkspace.providerRef,
-    )
+    ))
   ) {
     fail(
       "git_worktree_provider_ref_mismatch",
@@ -5507,6 +5734,144 @@ export type ExecutionWorkspaceReuseRequestForIssue = {
   existingExecutionWorkspaceAvailable: boolean;
 };
 
+export type ExecutionWorkspaceReuseCompatibility = {
+  reusable: boolean;
+  reason: string | null;
+};
+
+export async function evaluateExecutionWorkspaceReuseCompatibility(input: {
+  workspace: ExecutionWorkspace | null;
+  expectedCompanyId: string;
+  expectedProjectId: string | null;
+  expectedProjectWorkspaceId: string | null;
+  requestedExecutionWorkspaceMode: ReturnType<
+    typeof resolveExecutionWorkspaceMode
+  >;
+  requestedBranchName?: string | null;
+  inspectFilesystem?: boolean;
+}): Promise<ExecutionWorkspaceReuseCompatibility> {
+  const workspace = input.workspace;
+  if (!workspace) return { reusable: false, reason: "workspace_missing" };
+  if (workspace.status !== "active" || workspace.closedAt) {
+    return {
+      reusable: false,
+      reason:
+        workspace.status === "archived"
+          ? "workspace_archived"
+          : `workspace_not_active:${workspace.status}`,
+    };
+  }
+  if (workspace.deliveryState === "merged_via_pr" || workspace.deliveryState === "merged_by_ancestry") {
+    return { reusable: false, reason: `workspace_merged:${workspace.deliveryState}` };
+  }
+  if (workspace.companyId !== input.expectedCompanyId) {
+    return { reusable: false, reason: "workspace_company_mismatch" };
+  }
+  if (
+    !input.expectedProjectId ||
+    workspace.projectId !== input.expectedProjectId
+  ) {
+    return { reusable: false, reason: "workspace_project_mismatch" };
+  }
+  if (
+    !input.expectedProjectWorkspaceId ||
+    workspace.projectWorkspaceId !== input.expectedProjectWorkspaceId
+  ) {
+    return { reusable: false, reason: "workspace_project_workspace_mismatch" };
+  }
+  const compatiblePersistedModes =
+    input.requestedExecutionWorkspaceMode === "agent_default"
+      ? ["adapter_managed", "cloud_sandbox"]
+      : [input.requestedExecutionWorkspaceMode];
+  if (!compatiblePersistedModes.includes(workspace.mode)) {
+    return { reusable: false, reason: `workspace_mode_incompatible:${workspace.mode}` };
+  }
+  const strategyUsesGitWorktree = workspace.strategyType === "git_worktree";
+  const providerUsesGitWorktree = workspace.providerType === "git_worktree";
+  const usesProjectPrimary =
+    workspace.strategyType === "project_primary" &&
+    workspace.providerType === "local_fs";
+  const usesAdapterManaged =
+    workspace.strategyType === "adapter_managed" &&
+    workspace.providerType === "adapter_managed";
+  const usesCloudSandbox =
+    workspace.strategyType === "cloud_sandbox" &&
+    workspace.providerType === "cloud_sandbox";
+  const strategyCompatible =
+    input.requestedExecutionWorkspaceMode === "isolated_workspace"
+      ? strategyUsesGitWorktree && providerUsesGitWorktree
+      : input.requestedExecutionWorkspaceMode === "shared_workspace" ||
+          input.requestedExecutionWorkspaceMode === "operator_branch"
+        ? usesProjectPrimary
+        : usesProjectPrimary || usesAdapterManaged || usesCloudSandbox;
+  if (!strategyCompatible) {
+    return { reusable: false, reason: "workspace_strategy_incompatible" };
+  }
+  if (!strategyUsesGitWorktree) {
+    const requestedBranchName = readNonEmptyString(input.requestedBranchName);
+    const branchName = readNonEmptyString(workspace.branchName);
+    if (requestedBranchName && branchName !== requestedBranchName) {
+      return { reusable: false, reason: "workspace_branch_lineage_mismatch" };
+    }
+    const workspacePath =
+      readNonEmptyString(workspace.cwd) ??
+      readNonEmptyString(workspace.providerRef);
+    if (!workspacePath) {
+      return { reusable: false, reason: "workspace_path_missing" };
+    }
+    if (input.inspectFilesystem) {
+      const exists = await fs
+        .stat(workspacePath)
+        .then((entry) => entry.isDirectory())
+        .catch(() => false);
+      if (!exists) {
+        return { reusable: false, reason: "workspace_path_unavailable" };
+      }
+    }
+    return { reusable: true, reason: null };
+  }
+  const worktreePath =
+    readNonEmptyString(workspace.providerRef) ??
+    readNonEmptyString(workspace.cwd);
+  if (!worktreePath) {
+    return { reusable: false, reason: "workspace_worktree_path_missing" };
+  }
+  if (
+    workspace.cwd &&
+    workspace.providerRef &&
+    !(await sameResolvedPath(workspace.cwd, workspace.providerRef))
+  ) {
+    return { reusable: false, reason: "workspace_worktree_path_mismatch" };
+  }
+  const branchName = readNonEmptyString(workspace.branchName);
+  if (!branchName) return { reusable: false, reason: "workspace_branch_missing" };
+  const requestedBranchName = readNonEmptyString(input.requestedBranchName);
+  if (requestedBranchName && branchName !== requestedBranchName) {
+    return { reusable: false, reason: "workspace_branch_lineage_mismatch" };
+  }
+  if (input.inspectFilesystem) {
+    const inspection = await inspectManagedGitWorktreeBranch({
+      worktreePath,
+      expectedBranchName: branchName,
+    });
+    if (!inspection.valid) {
+      // A checked-out branch can still be a compatible forward descendant of
+      // the recorded branch. The restore path owns that ancestry check and,
+      // when explicitly enabled, records the audited forward reconciliation.
+      // Other inspection failures (missing/deleted path, non-worktree, etc.)
+      // are stale before restore and should be replaced when policy permits.
+      if (inspection.reasonCode === "branch_mismatch") {
+        return { reusable: true, reason: null };
+      }
+      return {
+        reusable: false,
+        reason: `workspace_worktree_unavailable:${inspection.reasonCode ?? "invalid"}`,
+      };
+    }
+  }
+  return { reusable: true, reason: null };
+}
+
 /**
  * Projectless native runs bind their immutable envelope to the run id even
  * though no project-scoped execution-workspace row exists. Treat that value
@@ -5550,9 +5915,7 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
     requestedShouldReuseExisting,
     existingExecutionWorkspaceAvailable:
       requestedShouldReuseExisting &&
-      input.existingExecutionWorkspaceStatus !== null &&
-      input.existingExecutionWorkspaceStatus !== undefined &&
-      input.existingExecutionWorkspaceStatus !== "archived",
+      input.existingExecutionWorkspaceStatus === "active",
   };
 }
 
@@ -5575,34 +5938,43 @@ export function resolveExecutionWorkspaceReuseProvisioningPolicy(input: {
   };
 }
 
-function formatInheritedExecutionWorkspaceReuseFailure(input: {
-  reason:
-    | "inherited_workspace_reuse_failed"
-    | "inherited_workspace_reuse_unavailable";
+function workspaceNotReusableFailure(input: {
   issueRef: WorkspaceReuseIssueRef;
   runId: string;
   executionWorkspaceId: string | null | undefined;
-  workspaceConfigFreshness: ExecutionWorkspaceConfigFreshnessDecision;
+  reason: string | null;
   cause?: unknown;
 }) {
   const issueLabel =
     input.issueRef?.identifier ?? input.issueRef?.id ?? input.runId;
-  const workspaceLabel = input.executionWorkspaceId ?? "unknown workspace";
+  const workspaceLabel = input.executionWorkspaceId ?? "missing workspace";
   const causeMessage =
     input.cause instanceof Error
       ? input.cause.message
       : input.cause != null
         ? String(input.cause)
         : null;
+  const invariant = input.reason ?? "workspace_restore_failed";
   const remediation =
-    input.reason === "inherited_workspace_reuse_failed"
-      ? "Inspect the referenced execution workspace restore/provision logs, repair or unarchive the workspace, or intentionally clear the issue's reuse_existing workspace binding before retrying."
-      : "Repair or unarchive the referenced execution workspace, or intentionally clear the issue's reuse_existing workspace binding before retrying.";
-  const message = causeMessage
-    ? `Issue ${issueLabel} requested inherited execution workspace reuse for ${workspaceLabel}, but the workspace could not be restored because ${causeMessage}.`
-    : `Issue ${issueLabel} requested inherited execution workspace reuse for ${workspaceLabel}, but the workspace could not be restored.`;
-
-  return `${message} ${remediation}`;
+    "Change the issue to isolated_workspace with a git_worktree strategy and a valid project workspace so Paperclip can create a fresh worktree, or bind another active compatible workspace.";
+  return new WorkspaceValidationFailure(
+    `Issue ${issueLabel} cannot reuse ${workspaceLabel}: ${invariant}${causeMessage ? ` (${causeMessage})` : ""}. ${remediation}`,
+    {
+      workspaceValidation: {
+        reason: "workspace_not_reusable",
+        invariant,
+        issueId: input.issueRef?.id ?? null,
+        issueIdentifier: input.issueRef?.identifier ?? null,
+        executionWorkspaceId: input.executionWorkspaceId ?? null,
+        remediation,
+        recommendedAction: {
+          type: "create_fresh_isolated_worktree",
+          requiredMode: "isolated_workspace",
+          requiredStrategy: "git_worktree",
+        },
+      },
+    },
+  );
 }
 
 export async function provisionExecutionWorkspaceForFreshnessDecision<
@@ -5615,6 +5987,9 @@ export async function provisionExecutionWorkspaceForFreshnessDecision<
   workspaceConfigFreshness: ExecutionWorkspaceConfigFreshnessDecision;
   restoreExistingWorkspace?: (() => Promise<T | null>) | null;
   realizeWorkspace: () => Promise<T>;
+  realizeFreshWorkspace?: (() => Promise<T>) | null;
+  allowFreshWorkspaceOnNonReusable?: boolean;
+  workspaceNotReusableReason?: string | null;
 }): Promise<{
   executionWorkspace: T;
   reusedExecutionWorkspace: T | null;
@@ -5635,40 +6010,41 @@ export async function provisionExecutionWorkspaceForFreshnessDecision<
   }
 
   let restored: T | null = null;
-  let reuseFailure: string | null = null;
+  let reuseFailure: unknown = null;
   try {
     restored = (await input.restoreExistingWorkspace?.()) ?? null;
   } catch (error) {
-    if (isWorkspaceValidationFailure(error)) {
-      throw error;
+    // Preserve detailed branch-containment and other governed workspace
+    // validation failures. A divergent or dirty workspace is not eligible for
+    // automatic replacement merely because fresh worktrees are generally
+    // allowed; its existing recovery path must arbitrate the unsafe state.
+    if (isWorkspaceValidationFailure(error)) throw error;
+    reuseFailure = error;
+  }
+
+  if (!restored) {
+    if (
+      input.workspaceNotReusableReason &&
+      input.allowFreshWorkspaceOnNonReusable &&
+      input.realizeFreshWorkspace
+    ) {
+      const executionWorkspace = await input.realizeFreshWorkspace();
+      return {
+        executionWorkspace,
+        reusedExecutionWorkspace: null,
+        policy: resolveExecutionWorkspaceReuseProvisioningPolicy({
+          requestedShouldReuseExisting: false,
+          workspaceConfigFreshness: input.workspaceConfigFreshness,
+        }),
+      };
     }
-    reuseFailure = formatInheritedExecutionWorkspaceReuseFailure({
-      reason: "inherited_workspace_reuse_failed",
+    throw workspaceNotReusableFailure({
       issueRef: input.issueRef,
       runId: input.runId,
       executionWorkspaceId: input.existingExecutionWorkspaceId,
-      workspaceConfigFreshness: input.workspaceConfigFreshness,
-      cause: error,
+      reason: input.workspaceNotReusableReason ?? null,
+      cause: reuseFailure,
     });
-  }
-
-  if (!restored) {
-    reuseFailure =
-      reuseFailure ??
-      formatInheritedExecutionWorkspaceReuseFailure({
-        reason: "inherited_workspace_reuse_unavailable",
-        issueRef: input.issueRef,
-        runId: input.runId,
-        executionWorkspaceId: input.existingExecutionWorkspaceId,
-        workspaceConfigFreshness: input.workspaceConfigFreshness,
-      });
-  }
-
-  if (reuseFailure) throw new Error(reuseFailure);
-  if (!restored) {
-    throw new Error(
-      "Expected restored execution workspace after reuse fallback handling",
-    );
   }
 
   return {
@@ -18465,6 +18841,12 @@ export function heartbeatService(
               issueContext.executionWorkspacePreference,
           }
         : null;
+      assertExecutionWorkspacePolicyCoherent({
+        policy: parsedProjectExecutionWorkspacePolicy,
+        issue: issueRef
+          ? { id: issueRef.id, identifier: issueRef.identifier }
+          : null,
+      });
       const continuationSummary = issueRef
         ? await getIssueContinuationSummaryDocument(db, issueRef.id)
         : null;
@@ -18648,6 +19030,14 @@ export function heartbeatService(
           bindingId: persistedNativeExecutionWorkspaceId,
           persistedWorkspaceFound: existingExecutionWorkspace !== null,
         });
+      const requestedExistingBranch =
+        readNonEmptyString(
+          issueExecutionWorkspaceSettings?.workspaceStrategy?.existingBranch,
+        ) ??
+        readNonEmptyString(
+          projectExecutionWorkspacePolicy?.workspaceStrategy?.existingBranch,
+        ) ??
+        readNonEmptyString(parseObject(config.workspaceStrategy).existingBranch);
       const workspaceReuseRequest =
         resolveExecutionWorkspaceReuseRequestForIssue({
           issueExecutionWorkspaceId: requestedExecutionWorkspaceId,
@@ -18656,12 +19046,21 @@ export function heartbeatService(
             : (issueRef?.executionWorkspacePreference ?? null),
           existingExecutionWorkspaceStatus:
             existingExecutionWorkspace?.status ?? null,
+          requestedExistingBranch,
+          existingExecutionWorkspaceBranchName:
+            existingExecutionWorkspace?.branchName ?? null,
         });
       const requestedShouldReuseExisting =
         workspaceReuseRequest.requestedShouldReuseExisting;
-      const reusableExistingExecutionWorkspace =
+      let reusableExistingExecutionWorkspace =
         workspaceReuseRequest.existingExecutionWorkspaceAvailable
           ? existingExecutionWorkspace
+          : null;
+      let workspaceNotReusableReason: string | null =
+        requestedShouldReuseExisting && !reusableExistingExecutionWorkspace
+          ? existingExecutionWorkspace
+            ? `workspace_not_active:${existingExecutionWorkspace.status}`
+            : "workspace_missing"
           : null;
       const requestedReusableExecutionWorkspaceConfig =
         reusableExistingExecutionWorkspace?.config ?? null;
@@ -19087,6 +19486,33 @@ export function heartbeatService(
         repoRef: resolvedWorkspace.repoRef,
         additionalWorkspaces: resolvedWorkspace.additionalWorkspaces,
       } satisfies ExecutionWorkspaceInput;
+      if (requestedShouldReuseExisting) {
+        const compatibility = await evaluateExecutionWorkspaceReuseCompatibility({
+          workspace: existingExecutionWorkspace,
+          expectedCompanyId: agent.companyId,
+          expectedProjectId: executionWorkspaceBase.projectId,
+          expectedProjectWorkspaceId: executionWorkspaceBase.workspaceId,
+          requestedExecutionWorkspaceMode,
+          requestedBranchName: requestedExistingBranch,
+          inspectFilesystem: true,
+        });
+        logger.info(
+          {
+            runId: run.id,
+            requestedExecutionWorkspaceId,
+            requestedExistingBranch,
+            compatibility,
+            workspaceStatus: existingExecutionWorkspace?.status ?? null,
+            workspaceBranchName:
+              existingExecutionWorkspace?.branchName ?? null,
+          },
+          "Evaluated execution workspace reuse compatibility",
+        );
+        workspaceNotReusableReason = compatibility.reason;
+        reusableExistingExecutionWorkspace = compatibility.reusable
+          ? existingExecutionWorkspace
+          : null;
+      }
       await assertGitWorktreeBaseWorkspaceReady({
         requestedExecutionWorkspaceMode,
         config: hostExecutionWorkspaceConfig,
@@ -19108,6 +19534,13 @@ export function heartbeatService(
         requestedExecutionWorkspaceMode,
         hostExecutionWorkspaceConfig,
       );
+      const allowFreshWorkspaceOnNonReusable =
+        !nativeRecoveryExecutionWorkspaceId &&
+        requestedExecutionWorkspaceMode === "isolated_workspace" &&
+        latestWorkspaceStrategyType === "git_worktree" &&
+        Boolean(executionWorkspaceBase.projectId) &&
+        Boolean(executionWorkspaceBase.workspaceId) &&
+        !requestedExistingBranch;
       const selectedEnvironmentConfigForFingerprint = parseObject(
         selectedEnvironmentForConfig?.config,
       );
@@ -19284,6 +19717,48 @@ export function heartbeatService(
                   recorder: workspaceOperationRecorder,
                   resolveGitAuth: workspaceGitAuthProvider,
                 })
+            : null,
+          allowFreshWorkspaceOnNonReusable,
+          workspaceNotReusableReason,
+          realizeFreshWorkspace: allowFreshWorkspaceOnNonReusable
+            ? () => {
+                const rawStrategy = parseObject(
+                  hostExecutionWorkspaceConfig.workspaceStrategy,
+                );
+                const { existingBranch: _existingBranch, ...strategyWithoutPin } =
+                  rawStrategy;
+                const branchTemplate =
+                  readNonEmptyString(rawStrategy.branchTemplate) ??
+                  "{{issue.identifier}}-{{slug}}";
+                return realizeExecutionWorkspace({
+                  db,
+                  base: executionWorkspaceBase,
+                  config: {
+                    ...hostExecutionWorkspaceConfig,
+                    workspaceStrategy: {
+                      ...strategyWithoutPin,
+                      type: "git_worktree",
+                      branchTemplate: `${branchTemplate}-refresh-${run.id.slice(0, 8)}`,
+                    },
+                  },
+                  issue: issueRef,
+                  agent: {
+                    id: agent.id,
+                    name: agent.name,
+                    companyId: agent.companyId,
+                  },
+                  recordedBranchOwnership: null,
+                  heartbeatRunId: run.id,
+                  enableWorkspaceBranchReconcileForward:
+                    resolvedInstanceSettings.experimental
+                      .enableWorkspaceBranchReconcileForward,
+                  enableWorkspaceDirtyQuarantineRepair:
+                    resolvedInstanceSettings.experimental
+                      .enableWorkspaceDirtyQuarantineRepair,
+                  recorder: workspaceOperationRecorder,
+                  resolveGitAuth: workspaceGitAuthProvider,
+                });
+              }
             : null,
           realizeWorkspace: () =>
             realizeExecutionWorkspace({
@@ -20347,6 +20822,22 @@ export function heartbeatService(
           const logEntry = formatRuntimeWorkspaceWarningLog(warning);
           await onLog(logEntry.stream, logEntry.chunk);
         }
+        await assertRepositoryBoundIsolatedWorkspaceValid({
+          requestedExecutionWorkspaceMode,
+          issue: issueRef
+            ? {
+                id: issueRef.id,
+                identifier: issueRef.identifier,
+                projectId: issueRef.projectId,
+                projectWorkspaceId: issueRef.projectWorkspaceId,
+                executionWorkspacePreference:
+                  issueRef.executionWorkspacePreference,
+              }
+            : null,
+          resolvedWorkspace,
+          executionWorkspace,
+          persistedExecutionWorkspace,
+        });
         await assertGitSensitiveAdapterWorkspaceValid({
           adapterType: agent.adapterType,
           agentId: agent.id,
