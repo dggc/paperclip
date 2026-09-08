@@ -17996,6 +17996,7 @@ export function heartbeatService(
   async function reconcileProductivityReviews(opts?: {
     now?: Date;
     companyId?: string;
+    repositoryAccess?: "none" | "source";
   }) {
     return productivityReviews.reconcileProductivityReviews({
       ...opts,

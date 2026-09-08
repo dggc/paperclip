@@ -406,6 +406,65 @@ describe("issue dependency wakeups in issue routes", () => {
     });
   });
 
+  it("does not duplicate the transactional source wake when a productivity review becomes terminal", async () => {
+    mockIssueService.getById.mockResolvedValue({
+      id: "review-1",
+      companyId: "company-1",
+      identifier: "PAP-102",
+      title: "Review productivity for PAP-100",
+      description: null,
+      status: "in_progress",
+      priority: "high",
+      parentId: "source-1",
+      originKind: "issue_productivity_review",
+      originId: "source-1",
+      assigneeAgentId: "agent-9",
+      assigneeUserId: null,
+      createdByAgentId: null,
+      createdByUserId: null,
+      executionWorkspaceId: null,
+      labels: [],
+      labelIds: [],
+    });
+    mockIssueService.update.mockResolvedValue({
+      id: "review-1",
+      companyId: "company-1",
+      identifier: "PAP-102",
+      title: "Review productivity for PAP-100",
+      description: null,
+      status: "done",
+      priority: "high",
+      parentId: "source-1",
+      originKind: "issue_productivity_review",
+      originId: "source-1",
+      assigneeAgentId: "agent-9",
+      assigneeUserId: null,
+      createdByAgentId: null,
+      createdByUserId: null,
+      executionWorkspaceId: null,
+      labels: [],
+      labelIds: [],
+      changes: { status: { from: "in_progress", to: "done" } },
+    });
+    mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue({
+      id: "source-1",
+      assigneeAgentId: "agent-1",
+      childIssueIds: ["review-1"],
+      childIssueSummaries: [],
+      childIssueSummaryTruncated: false,
+    });
+
+    const res = await request(await createApp()).patch("/api/issues/review-1").send({ status: "done" });
+
+    expect(res.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(mockIssueService.getWakeableParentAfterChildCompletion).not.toHaveBeenCalled();
+    expect(mockWakeup).not.toHaveBeenCalledWith(
+      "agent-1",
+      expect.objectContaining({ reason: "issue_children_completed" }),
+    );
+  });
+
   function issueRecord(overrides: Record<string, unknown> = {}) {
     return {
       id: "issue-1",

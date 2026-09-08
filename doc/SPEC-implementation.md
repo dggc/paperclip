@@ -738,6 +738,23 @@ decisions, and every other downstream effect must re-run its own authorization a
 approval checks. Mislabeling a governed action as an open interaction grants no
 downstream capability.
 
+### Productivity review creation and completion
+
+Generated productivity-review issues are control-plane work by default. They
+preserve company, goal, parent, and origin linkage to the source issue, but do
+not inherit its project, project workspace, execution workspace, reuse
+preference, repository path/provider/branch, serialization, or other repository
+execution settings. A review definition may explicitly request source-repository
+access; that opt-in uses the ordinary validated source-workspace inheritance
+path.
+
+A terminal productivity-review disposition and its durable continuation wake for
+the source issue are one database transaction. If either write fails, neither is
+committed, leaving the still-open review available to normal missing-disposition
+recovery. Retrying or racing the same terminal disposition queues at most one
+source continuation. The generic child-completion wake must not emit a second
+continuation for productivity-review children.
+
 ## 9.9 Task Watchdog Authority Contract
 
 A task watchdog is a scoped execution capacity for a configured watchdog agent on one watched issue subtree. It is not a separate principal, does not inherit board auth, and does not expand the selected agent's company boundary. The server must enforce the watchdog contract from persisted watchdog configuration and run context; custom instructions and prompt text can narrow the mandate but cannot expand it.

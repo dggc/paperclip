@@ -1925,6 +1925,7 @@ const BLOCKER_ATTENTION_OPEN_RECOVERY_ORIGIN_KIND = "harness_liveness_escalation
 const BLOCKER_ATTENTION_CHILD_TERMINAL_STATUSES = ["done", "cancelled"];
 const PRODUCTIVITY_REVIEW_ORIGIN_KIND = "issue_productivity_review";
 const PRODUCTIVITY_REVIEW_TERMINAL_STATUSES = ["done", "cancelled"];
+export const PRODUCTIVITY_REVIEW_RESOLVED_WAKE_REASON = "productivity_review_resolved";
 const PRODUCTIVITY_REVIEW_ACTIVITY_ACTIONS = [
   "issue.productivity_review_created",
   "issue.productivity_review_updated",
@@ -1934,6 +1935,75 @@ const PRODUCTIVITY_REVIEW_TRIGGERS: readonly IssueProductivityReviewTrigger[] = 
   "long_active_duration",
   "high_churn",
 ];
+
+async function enqueueProductivityReviewResolutionWake(
+  tx: Db,
+  input: {
+    reviewIssue: typeof issues.$inferSelect;
+    sourceIssueId: string;
+    actorAgentId: string | null;
+    actorUserId: string | null;
+  },
+) {
+  const sourceIssue = await tx
+    .select({
+      id: issues.id,
+      status: issues.status,
+      assigneeAgentId: issues.assigneeAgentId,
+    })
+    .from(issues)
+    .where(and(
+      eq(issues.companyId, input.reviewIssue.companyId),
+      eq(issues.id, input.sourceIssueId),
+    ))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  if (
+    !sourceIssue?.assigneeAgentId ||
+    PRODUCTIVITY_REVIEW_TERMINAL_STATUSES.includes(sourceIssue.status)
+  ) return null;
+
+  const idempotencyKey = `productivity-review-resolved:${input.reviewIssue.id}`;
+  const existingWake = await tx
+    .select({ id: agentWakeupRequests.id })
+    .from(agentWakeupRequests)
+    .where(and(
+      eq(agentWakeupRequests.companyId, input.reviewIssue.companyId),
+      eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+    ))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  if (existingWake) return existingWake.id;
+
+  return tx
+    .insert(agentWakeupRequests)
+    .values({
+      companyId: input.reviewIssue.companyId,
+      agentId: sourceIssue.assigneeAgentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: PRODUCTIVITY_REVIEW_RESOLVED_WAKE_REASON,
+      payload: {
+        issueId: sourceIssue.id,
+        taskId: sourceIssue.id,
+        resolvedProductivityReviewIssueId: input.reviewIssue.id,
+        reviewDisposition: input.reviewIssue.status,
+        _paperclipWakeContext: {
+          issueId: sourceIssue.id,
+          taskId: sourceIssue.id,
+          wakeReason: PRODUCTIVITY_REVIEW_RESOLVED_WAKE_REASON,
+          source: "issue.productivity_review_resolved",
+          resolvedProductivityReviewIssueId: input.reviewIssue.id,
+          reviewDisposition: input.reviewIssue.status,
+        },
+      },
+      requestedByActorType: input.actorAgentId ? "agent" : input.actorUserId ? "user" : "system",
+      requestedByActorId: input.actorAgentId ?? input.actorUserId ?? "issue_service",
+      idempotencyKey,
+    })
+    .returning({ id: agentWakeupRequests.id })
+    .then((rows) => rows[0]?.id ?? null);
+}
 
 function lowTrustBoundaryIssueCondition(
   companyId: string,
@@ -7981,6 +8051,22 @@ export function issueService(db: Db) {
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) return null;
+        const productivityReviewBecameTerminal =
+          receiptExisting.originKind === PRODUCTIVITY_REVIEW_ORIGIN_KIND &&
+          !PRODUCTIVITY_REVIEW_TERMINAL_STATUSES.includes(receiptExisting.status) &&
+          PRODUCTIVITY_REVIEW_TERMINAL_STATUSES.includes(updated.status) &&
+          typeof receiptExisting.originId === "string";
+        if (productivityReviewBecameTerminal) {
+          // The durable source continuation belongs in the same transaction as
+          // the disposition. If this insert fails, the review remains open and
+          // the normal missing-disposition recovery path can retry safely.
+          await enqueueProductivityReviewResolutionWake(tx as Db, {
+            reviewIssue: updated,
+            sourceIssueId: receiptExisting.originId!,
+            actorAgentId: actorAgentId ?? null,
+            actorUserId: actorUserId ?? null,
+          });
+        }
         if (existing.status !== updated.status) {
           if (
             (existing.status === "done" || existing.status === "cancelled")

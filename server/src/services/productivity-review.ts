@@ -48,6 +48,7 @@ type ProductivityRunSample = Pick<
   "id" | "agentId" | "status" | "livenessState" | "createdAt" | "nextAction" | "usageJson"
 >;
 type ProductivityReviewTrigger = "no_comment_streak" | "long_active_duration" | "high_churn";
+export type ProductivityReviewRepositoryAccess = "none" | "source";
 
 type ProductivityReviewThresholds = {
   noCommentStreakRuns: number;
@@ -703,7 +704,11 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
 
   async function createOrUpdateReview(
     evidence: ProductivityReviewEvidence,
-    opts: { prefix: string; thresholds: ProductivityReviewThresholds },
+    opts: {
+      prefix: string;
+      thresholds: ProductivityReviewThresholds;
+      repositoryAccess: ProductivityReviewRepositoryAccess;
+    },
   ) {
     const existing = await findOpenProductivityReview(evidence.sourceIssue.companyId, evidence.sourceIssue.id);
     if (existing) {
@@ -756,6 +761,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     }
 
     const ownerAgentId = await resolveReviewOwnerAgentId(evidence.sourceIssue, evidence.sourceAgent);
+    const useSourceRepository = opts.repositoryAccess === "source";
     let review: Awaited<ReturnType<typeof issuesSvc.create>>;
     try {
       review = await issuesSvc.create(evidence.sourceIssue.companyId, {
@@ -764,7 +770,12 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         status: "todo",
         priority: evidence.trigger === "long_active_duration" ? "medium" : "high",
         parentId: evidence.sourceIssue.id,
-        projectId: evidence.sourceIssue.projectId,
+        // A productivity review is a control-plane task by default. Parentage
+        // preserves source linkage, but must not silently grant the review the
+        // source issue's repository/project execution capability. Definitions
+        // that genuinely need the repository opt in to the legacy source
+        // inheritance path explicitly.
+        projectId: useSourceRepository ? evidence.sourceIssue.projectId : null,
         goalId: evidence.sourceIssue.goalId,
         billingCode: evidence.sourceIssue.billingCode,
         assigneeAgentId: ownerAgentId,
@@ -772,6 +783,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         originId: evidence.sourceIssue.id,
         originFingerprint: productivityReviewFingerprint(evidence.sourceIssue.id),
         requestDepth: clampIssueRequestDepth(evidence.sourceIssue.requestDepth + 1),
+        skipExecutionWorkspaceInheritance: !useSourceRepository,
       });
     } catch (error) {
       const maybe = error as { code?: string; constraint?: string; message?: string };
@@ -839,6 +851,8 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     companyId?: string;
     thresholds?: Partial<ProductivityReviewThresholds>;
     issueCreatedAtGte?: Date | null;
+    /** Explicit opt-in for review definitions that require the source repository. */
+    repositoryAccess?: ProductivityReviewRepositoryAccess;
   }) {
     const now = opts?.now ?? new Date();
     const thresholds = buildThresholds(opts?.thresholds);
@@ -908,7 +922,11 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         prefixCache.set(candidate.companyId, prefix);
       }
       try {
-        const outcome = await createOrUpdateReview(evidence, { prefix, thresholds });
+        const outcome = await createOrUpdateReview(evidence, {
+          prefix,
+          thresholds,
+          repositoryAccess: opts?.repositoryAccess ?? "none",
+        });
         if (outcome.kind === "created") result.created += 1;
         else if (outcome.kind === "updated") result.updated += 1;
         else if (outcome.kind === "creation_capped") result.creationCapped += 1;

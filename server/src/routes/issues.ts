@@ -157,6 +157,7 @@ import {
   REVIEW_PATH_RECOVERY_INSTRUCTION,
 } from "../services/recovery/review-path-recovery.js";
 import { hydrateSuccessfulRunHandoffLiveness } from "../services/successful-run-handoff-state.js";
+import { RECOVERY_ORIGIN_KINDS } from "../services/recovery/origins.js";
 import {
   TASK_WATCHDOG_ORIGIN_KIND,
   resolveTaskWatchdogMutationScope,
@@ -11360,7 +11361,11 @@ export function issueRoutes(
         }
       }
 
-      const becameDone = existing.status !== "done" && issue.status === "done";
+      const committedStatusChange = issue.changes?.status;
+      const hasCommittedChangeReceipt = issue.changes !== undefined;
+      const becameDone = hasCommittedChangeReceipt
+        ? committedStatusChange?.from !== "done" && committedStatusChange?.to === "done"
+        : existing.status !== "done" && issue.status === "done";
       if (becameDone) {
         const dependents = await svc.listWakeableBlockedDependents(issue.id);
         for (const dependent of dependents) {
@@ -11450,8 +11455,11 @@ export function issueRoutes(
         }
       }
 
-      const becameTerminal =
-        !["done", "cancelled"].includes(existing.status) && ["done", "cancelled"].includes(issue.status);
+      const becameTerminal = hasCommittedChangeReceipt
+        ? committedStatusChange !== undefined &&
+          !["done", "cancelled"].includes(String(committedStatusChange.from)) &&
+          ["done", "cancelled"].includes(String(committedStatusChange.to))
+        : !["done", "cancelled"].includes(existing.status) && ["done", "cancelled"].includes(issue.status);
       if (becameTerminal) {
         const expiredInteractions = await issueThreadInteractionService(db).expirePendingInteractionsForTerminalIssue(issue, {
           agentId: actor.agentId,
@@ -11465,7 +11473,13 @@ export function issueRoutes(
         });
         await destroyReusableSandboxLeasesForTerminalIssue(issue);
       }
-      if (becameTerminal && issue.parentId) {
+      // Productivity-review completion persists its source continuation in the
+      // issue transaction. Do not also emit the generic child-completion wake.
+      if (
+        becameTerminal &&
+        issue.parentId &&
+        issue.originKind !== RECOVERY_ORIGIN_KINDS.issueProductivityReview
+      ) {
         const parent = await svc.getWakeableParentAfterChildCompletion(issue.parentId);
         if (parent) {
           addWakeup(parent.assigneeAgentId, {

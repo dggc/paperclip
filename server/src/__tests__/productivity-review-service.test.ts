@@ -3,12 +3,17 @@ import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   companies,
   createDb,
+  executionWorkspaces,
+  goals,
   heartbeatRuns,
   issueComments,
   issues,
+  projects,
+  projectWorkspaces,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -23,6 +28,11 @@ import {
   PRODUCTIVITY_REVIEW_ORIGIN_KIND,
   productivityReviewService,
 } from "../services/productivity-review.ts";
+import {
+  issueService,
+  PRODUCTIVITY_REVIEW_RESOLVED_WAKE_REASON,
+} from "../services/issues.ts";
+import { instanceSettingsService } from "../services/instance-settings.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -111,6 +121,91 @@ describeEmbeddedPostgres("productivity review service", () => {
     });
 
     return { companyId, managerId, coderId, issueId, issuePrefix, createdAt };
+  }
+
+  async function bindSourceIssueToSerializedRepository(
+    seeded: Awaited<ReturnType<typeof seedAssignedIssue>>,
+  ) {
+    const goalId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    const executionWorkspaceSettings = {
+      mode: "isolated_workspace",
+      workspaceStrategy: {
+        type: "git_worktree",
+        existingBranch: "gal/source-review",
+      },
+      serialization: { mode: "exclusive" },
+    };
+
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    await db.insert(goals).values({
+      id: goalId,
+      companyId: seeded.companyId,
+      title: "Ship workspace-safe reviews",
+      level: "company",
+      status: "active",
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId: seeded.companyId,
+      goalId,
+      name: "Workspace-bound project",
+      status: "in_progress",
+      leadAgentId: seeded.managerId,
+      executionWorkspacePolicy: {
+        enabled: true,
+        defaultMode: "isolated_workspace",
+        defaultProjectWorkspaceId: projectWorkspaceId,
+        workspaceStrategy: { type: "git_worktree" },
+      },
+    });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId: seeded.companyId,
+      projectId,
+      name: "Primary repository",
+      sourceType: "local_path",
+      cwd: "/workspace/repository",
+      repoRef: "main",
+      remoteProvider: "forgejo",
+      sharedWorkspaceKey: "serialized-repository",
+      isPrimary: true,
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId: seeded.companyId,
+      projectId,
+      projectWorkspaceId,
+      sourceIssueId: seeded.issueId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Serialized source lease",
+      status: "active",
+      cwd: "/workspace/repository/.worktrees/source",
+      baseRef: "main",
+      branchName: "gal/source-review",
+      providerType: "git_worktree",
+      providerRef: "/workspace/repository/.worktrees/source",
+      metadata: { serialization: "exclusive", provider: "local" },
+    });
+    await db.update(issues).set({
+      projectId,
+      projectWorkspaceId,
+      goalId,
+      executionWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+      executionWorkspaceSettings,
+    }).where(eq(issues.id, seeded.issueId));
+
+    return {
+      goalId,
+      projectId,
+      projectWorkspaceId,
+      executionWorkspaceId,
+      executionWorkspaceSettings,
+    };
   }
 
   async function insertRuns(input: {
@@ -208,6 +303,168 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("No-comment completed-run streak: 10");
 
     expect(await listRefreshComments(reviews[0]!.id)).toHaveLength(0);
+  });
+
+  it("keeps generated reviews workspace-neutral while preserving goal and source linkage", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const repository = await bindSourceIssueToSerializedRepository(seeded);
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review).toMatchObject({
+      companyId: seeded.companyId,
+      goalId: repository.goalId,
+      parentId: seeded.issueId,
+      originId: seeded.issueId,
+      projectId: null,
+      projectWorkspaceId: null,
+      executionWorkspaceId: null,
+      executionWorkspacePreference: null,
+      executionWorkspaceSettings: null,
+    });
+    const leases = await db
+      .select()
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.companyId, seeded.companyId));
+    expect(leases).toHaveLength(1);
+    expect(leases[0]).toMatchObject({
+      id: repository.executionWorkspaceId,
+      sourceIssueId: seeded.issueId,
+      branchName: "gal/source-review",
+      strategyType: "git_worktree",
+    });
+  });
+
+  it("inherits the source repository only through the explicit review-definition opt-in", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const repository = await bindSourceIssueToSerializedRepository(seeded);
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      repositoryAccess: "source",
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review).toMatchObject({
+      goalId: repository.goalId,
+      parentId: seeded.issueId,
+      originId: seeded.issueId,
+      projectId: repository.projectId,
+      projectWorkspaceId: repository.projectWorkspaceId,
+      executionWorkspaceId: repository.executionWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+      executionWorkspaceSettings: repository.executionWorkspaceSettings,
+    });
+  });
+
+  it("commits review disposition with one durable source wake and rolls both back on failure", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+    const reviews = productivityReviewService(db);
+    await reviews.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review).toBeDefined();
+
+    await db.execute(sql.raw(`
+      CREATE FUNCTION reject_productivity_review_resolution_wake() RETURNS trigger AS $$
+      BEGIN
+        IF NEW.reason = '${PRODUCTIVITY_REVIEW_RESOLVED_WAKE_REASON}' THEN
+          RAISE EXCEPTION 'synthetic productivity review disposition failure';
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+      CREATE TRIGGER reject_productivity_review_resolution_wake
+      BEFORE INSERT ON agent_wakeup_requests
+      FOR EACH ROW EXECUTE FUNCTION reject_productivity_review_resolution_wake();
+    `));
+
+    const issuesSvc = issueService(db);
+    try {
+      await expect(issuesSvc.update(review!.id, {
+        status: "done",
+        actorAgentId: seeded.managerId,
+      })).rejects.toThrow(/agent_wakeup_requests/);
+    } finally {
+      await db.execute(sql.raw(`
+        DROP TRIGGER IF EXISTS reject_productivity_review_resolution_wake ON agent_wakeup_requests;
+        DROP FUNCTION IF EXISTS reject_productivity_review_resolution_wake();
+      `));
+    }
+
+    const reviewAfterFailure = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, review!.id))
+      .then((rows) => rows[0]);
+    expect(reviewAfterFailure?.status).toBe("todo");
+    expect((await reviews.isProductivityReviewContinuationHoldActive({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      agentId: seeded.coderId,
+      now,
+    })).held).toBe(true);
+
+    await Promise.all([
+      issuesSvc.update(review!.id, { status: "done", actorAgentId: seeded.managerId }),
+      issuesSvc.update(review!.id, { status: "done", actorAgentId: seeded.managerId }),
+    ]);
+    await issuesSvc.update(review!.id, { status: "done", actorAgentId: seeded.managerId });
+
+    const resolutionWakes = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.companyId, seeded.companyId),
+        eq(agentWakeupRequests.reason, PRODUCTIVITY_REVIEW_RESOLVED_WAKE_REASON),
+      ));
+    expect(resolutionWakes).toHaveLength(1);
+    expect(resolutionWakes[0]).toMatchObject({
+      agentId: seeded.coderId,
+      status: "queued",
+      idempotencyKey: `productivity-review-resolved:${review!.id}`,
+      payload: expect.objectContaining({
+        issueId: seeded.issueId,
+        resolvedProductivityReviewIssueId: review!.id,
+        reviewDisposition: "done",
+      }),
+    });
+    expect((await reviews.isProductivityReviewContinuationHoldActive({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      agentId: seeded.coderId,
+      now,
+    })).held).toBe(false);
   });
 
   it("refreshes open productivity reviews only once per interval and caps refresh comments", async () => {
