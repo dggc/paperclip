@@ -166,6 +166,16 @@ export {
   type ParsedCustomImageSetupSshCommand,
 } from "./environment-custom-image-terminal-sessions.js";
 export { executionWorkspaceService } from "./execution-workspaces.js";
+export {
+  auditExecutionWorkspaceFleet,
+  classifyExecutionWorkspaceRemediation,
+  remediateExecutionWorkspaceFleet,
+  type ExecutionWorkspaceFleetAudit,
+  type ExecutionWorkspaceFleetRemediation,
+  type ExecutionWorkspaceIncidentClass,
+  type ExecutionWorkspaceRemediationSnapshot,
+  type SanitizedExecutionWorkspaceFinding,
+} from "./execution-workspace-remediation.js";
 export { workspaceOperationService } from "./workspace-operations.js";
 export {
   workspaceRuntimeLeaseService,

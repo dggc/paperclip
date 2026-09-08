@@ -491,6 +491,34 @@ If the `codex` CLI is not installed or not on `PATH`, `codex_local` agent runs f
 
 Local adapters require their corresponding CLI/session setup on the machine running Paperclip. External adapters are installed through the adapter/plugin flow and should not require hardcoded imports in `server/` or `ui/`.
 
+### Auditing and remediating invalid execution-workspace bindings
+
+The fleet remediation command is a dry run unless `--apply` is supplied. Its
+JSON report includes issue identifiers, lifecycle enums, booleans, incident
+classes, and stable fingerprints; it never includes workspace paths, repository
+URLs, branch names, issue text, run output, or raw recovery diagnostics.
+
+```sh
+# Audit every company without mutation.
+pnpm execution-workspaces:remediate
+
+# Limit the dry run to one company.
+pnpm execution-workspaces:remediate -- --company <company-id>
+
+# Print counts only (useful for a fleet health check).
+pnpm execution-workspaces:remediate -- --summary --company <company-id>
+
+# Apply only explicitly approved findings. Both flags are mandatory for apply.
+pnpm execution-workspaces:remediate -- --apply --company <company-id> \
+  --issue <issue-id-or-identifier> [--issue <another-issue>]
+```
+
+Apply locks each selected issue, refuses issues with live execution, clears only
+the invalid `execution_workspace_id`, preserves the project workspace and issue
+policy, resolves matching active recovery actions, writes sanitized activity
+evidence, and schedules one fresh run. Repeating the command for the same state
+does not queue a duplicate run.
+
 ## Config Freshness
 
 Agent, project, environment, secret, skill, and workspace config edits are sampled at the next run boundary. A heartbeat that is already running finishes with the config it started with.
