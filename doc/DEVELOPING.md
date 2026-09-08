@@ -516,8 +516,12 @@ pnpm execution-workspaces:remediate -- --apply --company <company-id> \
 Apply locks each selected issue, refuses issues with live execution, clears only
 the invalid `execution_workspace_id`, preserves the project workspace and issue
 policy, resolves matching active recovery actions, writes sanitized activity
-evidence, and schedules one fresh run. Repeating the command for the same state
-does not queue a duplicate run.
+evidence, and schedules one fresh run through the normal heartbeat queue. The
+clear and its remediation reservation commit atomically; the queue transaction
+adopts that reservation, while a partial unique index provides a database-level
+at-most-once guard for the same stale-state fingerprint. Repeating the command
+for the same state does not queue a duplicate run, but a later distinct stale
+workspace lifecycle remains recoverable.
 
 ## Config Freshness
 

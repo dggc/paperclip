@@ -3,7 +3,9 @@ import { loadConfig } from "../server/src/config.js";
 import {
   auditExecutionWorkspaceFleet,
   remediateExecutionWorkspaceFleet,
+  type QueueExecutionWorkspaceRemediationWake,
 } from "../server/src/services/execution-workspace-remediation.js";
+import { heartbeatService } from "../server/src/services/heartbeat.js";
 
 function flagValues(name: string) {
   const values: string[] = [];
@@ -29,6 +31,31 @@ async function main() {
   const summaryOnly = hasFlag("--summary");
   const companyIds = flagValues("--company");
   const issueRefs = flagValues("--issue");
+  const heartbeat = heartbeatService(db);
+  const queueWakeup: QueueExecutionWorkspaceRemediationWake = async (input) => {
+    const safeContext = {
+      issueId: input.issueId,
+      taskId: input.issueId,
+      taskKey: input.issueIdentifier ?? input.issueId,
+      projectId: input.projectId,
+      wakeReason: "execution_workspace_fleet_remediation",
+      workspaceRemediation: {
+        version: 1,
+        fingerprint: input.fingerprint,
+        incidentClasses: input.incidentClasses,
+      },
+    };
+    return heartbeat.wakeup(input.agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "execution_workspace_fleet_remediation",
+      payload: safeContext,
+      contextSnapshot: safeContext,
+      requestedByActorType: "system",
+      requestedByActorId: input.actorId,
+      idempotencyKey: input.idempotencyKey,
+    });
+  };
 
   if (apply && companyIds.length !== 1) {
     throw new Error("--apply requires exactly one --company <id> to keep mutation scope explicit.");
@@ -47,6 +74,7 @@ async function main() {
           companyId,
           issueRefs,
           actorId: "execution_workspace_remediation_cli",
+          queueWakeup,
         })
       : await auditExecutionWorkspaceFleet(db, { companyId }));
   }
@@ -76,8 +104,7 @@ async function main() {
   }, null, 2));
 }
 
-void main().catch((error) => {
-  const message = error instanceof Error ? error.message : String(error);
-  console.error(`Execution-workspace remediation failed: ${message}`);
+void main().catch(() => {
+  console.error("Execution-workspace remediation failed: execution_workspace_remediation_failed");
   process.exitCode = 1;
 });

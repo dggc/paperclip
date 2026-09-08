@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { and, desc, eq, inArray, ne, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, lt, ne, sql } from "drizzle-orm";
 import {
   activityLog,
   agentWakeupRequests,
@@ -12,17 +12,25 @@ import {
   projects,
   type Db,
 } from "@paperclipai/db";
+import type {
+  ExecutionWorkspace,
+  ExecutionWorkspaceDeliveryState,
+} from "@paperclipai/shared";
 import {
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
+  resolveEffectiveWorkspaceStrategyType,
   resolveExecutionWorkspaceMode,
 } from "./execution-workspace-policy.js";
+import { executionWorkspaceService } from "./execution-workspaces.js";
+import { evaluateExecutionWorkspaceReuseCompatibility } from "./heartbeat.js";
 
 const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"] as const;
 const LIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const LIVE_WAKE_STATUSES = ["queued", "claimed", "deferred_issue_execution"] as const;
 const ACTIVE_RECOVERY_STATUSES = ["active", "escalated"] as const;
 const REMEDIATION_WAKE_PREFIX = "execution-workspace-remediation:";
+const REMEDIATION_PENDING_LEASE_MS = 5 * 60 * 1_000;
 
 export type ExecutionWorkspaceIncidentClass =
   | "fallback_agent_home_cwd"
@@ -38,11 +46,14 @@ type IssueRow = Pick<typeof issues.$inferSelect,
   | "executionWorkspacePreference" | "executionWorkspaceSettings"
 >;
 type ProjectRow = Pick<typeof projects.$inferSelect, "id" | "companyId" | "executionWorkspacePolicy">;
-type ProjectWorkspaceRow = Pick<typeof projectWorkspaces.$inferSelect, "id" | "projectId" | "isPrimary">;
+type ProjectWorkspaceRow = Pick<typeof projectWorkspaces.$inferSelect, "id" | "projectId" | "cwd" | "isPrimary">;
 type ExecutionWorkspaceRow = Pick<typeof executionWorkspaces.$inferSelect,
-  | "id" | "companyId" | "projectId" | "projectWorkspaceId" | "mode" | "strategyType"
-  | "status" | "cwd" | "branchName" | "closedAt"
->;
+  | "id" | "companyId" | "projectId" | "projectWorkspaceId" | "sourceIssueId"
+  | "mode" | "strategyType" | "name" | "status" | "cwd" | "repoUrl" | "baseRef"
+  | "branchName" | "providerType" | "providerRef" | "derivedFromExecutionWorkspaceId"
+  | "lastUsedAt" | "openedAt" | "closedAt" | "cleanupEligibleAt" | "cleanupReason"
+  | "metadata" | "createdAt" | "updatedAt"
+> & { deliveryState: ExecutionWorkspaceDeliveryState };
 type RecoveryActionRow = Pick<typeof issueRecoveryActions.$inferSelect,
   "id" | "sourceIssueId" | "status" | "cause" | "fingerprint"
 > & { evidenceReason: string | null };
@@ -66,7 +77,20 @@ export type ExecutionWorkspaceRemediationSnapshot = {
   latestRun: HeartbeatRunRow | null;
   remediationWake: WakeupRow | null;
   pathExists?: (value: string) => boolean;
+  reuseCompatibility?: { reusable: boolean; reason: string | null };
+  evaluatedAt?: Date;
 };
+
+export type QueueExecutionWorkspaceRemediationWake = (input: {
+  agentId: string;
+  issueId: string;
+  projectId: string | null;
+  issueIdentifier: string | null;
+  fingerprint: string;
+  incidentClasses: ExecutionWorkspaceIncidentClass[];
+  idempotencyKey: string;
+  actorId: string;
+}) => Promise<{ id: string } | null>;
 
 export type SanitizedExecutionWorkspaceFinding = {
   issueId: string;
@@ -75,17 +99,19 @@ export type SanitizedExecutionWorkspaceFinding = {
   fingerprint: string;
   recoveryActionIds: string[];
   evidence: {
-    issueStatus: string;
+    issueStatus: "backlog" | "todo" | "in_progress" | "in_review" | "blocked" | "invalid";
     projectIdPresent: boolean;
     projectWorkspaceIdentity: "not_applicable" | "missing" | "matching" | "mismatched";
-    requestedMode: string | null;
-    effectiveMode: string;
-    effectiveStrategy: string;
+    requestedMode: "inherit" | "shared_workspace" | "isolated_workspace" | "operator_branch" | "reuse_existing" | "agent_default" | "invalid" | null;
+    effectiveMode: "shared_workspace" | "isolated_workspace" | "operator_branch" | "agent_default";
+    effectiveStrategy: "project_primary" | "git_worktree" | "adapter_managed" | "cloud_sandbox";
     executionWorkspace: {
       bound: boolean;
-      mode: string | null;
-      strategyType: string | null;
-      status: string | null;
+      mode: "shared_workspace" | "isolated_workspace" | "operator_branch" | "adapter_managed" | "cloud_sandbox" | "invalid" | null;
+      strategyType: "project_primary" | "git_worktree" | "adapter_managed" | "cloud_sandbox" | "invalid" | null;
+      providerType: "local_fs" | "git_worktree" | "adapter_managed" | "cloud_sandbox" | "invalid" | null;
+      status: "active" | "idle" | "in_review" | "archived" | "cleanup_failed" | "invalid" | null;
+      deliveryState: ExecutionWorkspaceDeliveryState;
       hasCwd: boolean;
       hasBranch: boolean;
       pathPresent: boolean | null;
@@ -115,7 +141,7 @@ export type ExecutionWorkspaceFleetRemediation = {
   remediatedIssueCount: number;
   queuedRunCount: number;
   resolvedRecoveryActionCount: number;
-  skipped: Array<{ issueId: string; issueIdentifier: string | null; reason: string }>;
+  skipped: Array<{ issueId: string | null; issueIdentifier: string | null; reason: string }>;
   before: ExecutionWorkspaceFleetAudit;
   after: ExecutionWorkspaceFleetAudit;
 };
@@ -132,17 +158,14 @@ function actionMentionsIncident(action: RecoveryActionRow, incident: ExecutionWo
 }
 
 function resolvedStrategy(
-  effectiveMode: string,
+  effectiveMode: ReturnType<typeof resolveExecutionWorkspaceMode>,
   projectPolicy: ReturnType<typeof parseProjectExecutionWorkspacePolicy>,
   issueSettings: ReturnType<typeof parseIssueExecutionWorkspaceSettings>,
 ) {
-  return issueSettings?.workspaceStrategy?.type
-    ?? projectPolicy?.workspaceStrategy?.type
-    ?? (effectiveMode === "isolated_workspace" || effectiveMode === "operator_branch"
-      ? "git_worktree"
-      : effectiveMode === "agent_default"
-        ? "adapter_managed"
-        : "project_primary");
+  return resolveEffectiveWorkspaceStrategyType(effectiveMode, {
+    workspaceStrategy:
+      issueSettings?.workspaceStrategy ?? projectPolicy?.workspaceStrategy ?? null,
+  });
 }
 
 function stableFingerprint(value: unknown) {
@@ -160,15 +183,58 @@ function emptyIncidentCounts(): Record<ExecutionWorkspaceIncidentClass, number> 
   };
 }
 
+const SAFE_ISSUE_STATUSES = new Set(["backlog", "todo", "in_progress", "in_review", "blocked"]);
+const SAFE_REQUESTED_MODES = new Set([
+  "inherit", "shared_workspace", "isolated_workspace", "operator_branch", "reuse_existing", "agent_default",
+]);
+const SAFE_WORKSPACE_MODES = new Set([
+  "shared_workspace", "isolated_workspace", "operator_branch", "adapter_managed", "cloud_sandbox",
+]);
+const SAFE_STRATEGY_TYPES = new Set(["project_primary", "git_worktree", "adapter_managed", "cloud_sandbox"]);
+const SAFE_PROVIDER_TYPES = new Set(["local_fs", "git_worktree", "adapter_managed", "cloud_sandbox"]);
+const SAFE_WORKSPACE_STATUSES = new Set(["active", "idle", "in_review", "archived", "cleanup_failed"]);
+const SAFE_ISSUE_IDENTIFIER = /^[A-Z][A-Z0-9]{0,15}-[1-9][0-9]{0,11}$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function allowlisted<T extends string>(value: string | null | undefined, allowed: Set<string>): T | "invalid" | null {
+  if (value == null) return null;
+  return allowed.has(value) ? value as T : "invalid";
+}
+
+function sanitizedIssueIdentifier(value: string | null | undefined) {
+  if (!value) return null;
+  const normalized = value.trim().toUpperCase();
+  return SAFE_ISSUE_IDENTIFIER.test(normalized) ? normalized : null;
+}
+
+function normalizeIssueRef(value: string) {
+  const trimmed = value.trim();
+  if (UUID.test(trimmed)) return trimmed.toLowerCase();
+  const identifier = trimmed.toUpperCase();
+  return SAFE_ISSUE_IDENTIFIER.test(identifier) ? identifier : null;
+}
+
+function toCompatibilityWorkspace(row: ExecutionWorkspaceRow): ExecutionWorkspace {
+  return {
+    ...row,
+    mode: row.mode as ExecutionWorkspace["mode"],
+    strategyType: row.strategyType as ExecutionWorkspace["strategyType"],
+    status: row.status as ExecutionWorkspace["status"],
+    providerType: row.providerType as ExecutionWorkspace["providerType"],
+    config: null,
+    metadata: (row.metadata as Record<string, unknown> | null) ?? null,
+  };
+}
+
 /**
  * Classify one open issue without returning cwd, repository URL, branch name,
  * run output, issue text, or recovery diagnostics. The classifier deliberately
  * exposes booleans and lifecycle enums only so its result is safe to attach to
  * an issue or an operator audit.
  */
-export function classifyExecutionWorkspaceRemediation(
+export async function classifyExecutionWorkspaceRemediation(
   snapshot: ExecutionWorkspaceRemediationSnapshot,
-): SanitizedExecutionWorkspaceFinding | null {
+): Promise<SanitizedExecutionWorkspaceFinding | null> {
   const { issue, project, projectWorkspace, primaryProjectWorkspace, executionWorkspace } = snapshot;
   const projectPolicy = parseProjectExecutionWorkspacePolicy(project?.executionWorkspacePolicy);
   const issueSettings = parseIssueExecutionWorkspaceSettings(issue.executionWorkspaceSettings);
@@ -190,8 +256,9 @@ export function classifyExecutionWorkspaceRemediation(
       : !projectWorkspace || projectWorkspace.projectId !== issue.projectId
         ? "mismatched" as const
         : "matching" as const;
-  const pathPresent = executionWorkspace?.cwd
-    ? (snapshot.pathExists ?? existsSync)(executionWorkspace.cwd)
+  const executionPath = executionWorkspace?.providerRef ?? executionWorkspace?.cwd ?? null;
+  const pathPresent = executionPath
+    ? (snapshot.pathExists ?? existsSync)(executionPath)
     : null;
   const executionProjectMatches = executionWorkspace && issue.projectId
     ? executionWorkspace.projectId === issue.projectId
@@ -203,25 +270,30 @@ export function classifyExecutionWorkspaceRemediation(
     : executionWorkspace
       ? executionWorkspace.projectWorkspaceId === null
       : null;
-  const lifecycleReusable = Boolean(
-    executionWorkspace
-      && executionWorkspace.status === "active"
-      && executionWorkspace.closedAt === null
-      && pathPresent === true,
-  );
-  const isolatedRealized = Boolean(
-    executionWorkspace
-      && executionWorkspace.mode === "isolated_workspace"
-      && executionWorkspace.strategyType === "git_worktree"
-      && executionWorkspace.cwd
-      && executionWorkspace.branchName
-      && lifecycleReusable
-      && executionProjectMatches === true
-      && executionProjectWorkspaceMatches !== false,
-  );
-  const remediationPending = Boolean(
-    snapshot.remediationWake
-      && LIVE_WAKE_STATUSES.includes(snapshot.remediationWake.status as (typeof LIVE_WAKE_STATUSES)[number]),
+  const requestedBranchName = issueSettings?.workspaceStrategy?.existingBranch
+    ?? projectPolicy?.workspaceStrategy?.existingBranch
+    ?? null;
+  const reuseCompatibility = executionWorkspace
+    ? snapshot.reuseCompatibility ?? await evaluateExecutionWorkspaceReuseCompatibility({
+        workspace: toCompatibilityWorkspace(executionWorkspace),
+        expectedCompanyId: issue.companyId,
+        expectedProjectId: issue.projectId,
+        expectedProjectWorkspaceId,
+        requestedExecutionWorkspaceMode: effectiveMode,
+        requestedBranchName,
+        expectedRepoRoot: projectWorkspace?.cwd ?? primaryProjectWorkspace?.cwd ?? null,
+        inspectFilesystem: true,
+      })
+    : { reusable: false, reason: "workspace_missing" };
+  const lifecycleReusable = Boolean(reuseCompatibility.reusable && pathPresent === true);
+  const remediationWakeStatus = snapshot.remediationWake?.status ?? null;
+  const pendingReservationIsLive = remediationWakeStatus === "remediation_pending"
+    && Boolean(snapshot.remediationWake?.createdAt)
+    && snapshot.remediationWake!.createdAt.getTime()
+      >= (snapshot.evaluatedAt ?? new Date()).getTime() - REMEDIATION_PENDING_LEASE_MS;
+  const remediationPending = pendingReservationIsLive || Boolean(
+    remediationWakeStatus
+      && LIVE_WAKE_STATUSES.includes(remediationWakeStatus as (typeof LIVE_WAKE_STATUSES)[number]),
   );
   const latestRunReason = snapshot.latestRun?.workspaceValidationReason ?? null;
   const fallbackAction = snapshot.activeRecoveryActions.some((action) =>
@@ -238,9 +310,10 @@ export function classifyExecutionWorkspaceRemediation(
     incidents.push("mismatched_project_workspace_identity");
   }
   if (
-    executionWorkspace
+    issue.executionWorkspaceId
     && (
-      !lifecycleReusable
+      !executionWorkspace
+      || !lifecycleReusable
       || executionProjectMatches !== true
       || executionProjectWorkspaceMatches === false
     )
@@ -248,34 +321,35 @@ export function classifyExecutionWorkspaceRemediation(
     incidents.push("stale_execution_workspace_binding");
   }
   if (
-    (effectiveMode === "isolated_workspace" || effectiveMode === "operator_branch")
-    && effectiveStrategy === "git_worktree"
-    && !isolatedRealized
+    effectiveMode === "isolated_workspace"
+    && !lifecycleReusable
     && !remediationPending
   ) {
     incidents.push("unrealized_isolated_workspace_request");
   }
   if (
     issue.executionWorkspacePreference === "reuse_existing"
-    && executionWorkspace
+    && issue.executionWorkspaceId
     && !lifecycleReusable
   ) {
     incidents.push("non_reusable_reuse_existing_binding");
   }
   if (incidents.length === 0) return null;
 
-  const evidence = {
-    issueStatus: issue.status,
+  const evidence: SanitizedExecutionWorkspaceFinding["evidence"] = {
+    issueStatus: (allowlisted(issue.status, SAFE_ISSUE_STATUSES) ?? "invalid") as SanitizedExecutionWorkspaceFinding["evidence"]["issueStatus"],
     projectIdPresent: Boolean(issue.projectId),
     projectWorkspaceIdentity,
-    requestedMode,
+    requestedMode: allowlisted(requestedMode, SAFE_REQUESTED_MODES) as SanitizedExecutionWorkspaceFinding["evidence"]["requestedMode"],
     effectiveMode,
     effectiveStrategy,
     executionWorkspace: {
       bound: Boolean(issue.executionWorkspaceId),
-      mode: executionWorkspace?.mode ?? null,
-      strategyType: executionWorkspace?.strategyType ?? null,
-      status: executionWorkspace?.status ?? null,
+      mode: allowlisted(executionWorkspace?.mode, SAFE_WORKSPACE_MODES),
+      strategyType: allowlisted(executionWorkspace?.strategyType, SAFE_STRATEGY_TYPES),
+      providerType: allowlisted(executionWorkspace?.providerType, SAFE_PROVIDER_TYPES),
+      status: allowlisted(executionWorkspace?.status, SAFE_WORKSPACE_STATUSES),
+      deliveryState: executionWorkspace?.deliveryState ?? "unknown",
       hasCwd: Boolean(executionWorkspace?.cwd),
       hasBranch: Boolean(executionWorkspace?.branchName),
       pathPresent,
@@ -290,9 +364,26 @@ export function classifyExecutionWorkspaceRemediation(
     .sort();
   return {
     issueId: issue.id,
-    issueIdentifier: issue.identifier,
+    issueIdentifier: sanitizedIssueIdentifier(issue.identifier),
     incidentClasses: [...new Set(incidents)].sort() as ExecutionWorkspaceIncidentClass[],
-    fingerprint: stableFingerprint({ issueId: issue.id, incidents: [...new Set(incidents)].sort(), evidence }),
+    fingerprint: stableFingerprint({
+      issueId: issue.id,
+      incidents: [...new Set(incidents)].sort(),
+      evidence,
+      stateIdentity: stableFingerprint({
+        executionWorkspaceId: issue.executionWorkspaceId,
+        executionWorkspaceUpdatedAt: executionWorkspace?.updatedAt?.toISOString() ?? null,
+        lifecycleGeneration:
+          executionWorkspace?.metadata && typeof executionWorkspace.metadata.lifecycleGeneration === "number"
+            ? executionWorkspace.metadata.lifecycleGeneration
+            : null,
+        recoveryActions: snapshot.activeRecoveryActions.map((action) => ({
+          id: action.id,
+          status: action.status,
+          fingerprint: action.fingerprint,
+        })).sort((a, b) => a.id.localeCompare(b.id)),
+      }),
+    }),
     recoveryActionIds,
     evidence,
   };
@@ -302,6 +393,7 @@ async function loadAuditSnapshots(
   db: DbReader,
   companyId: string,
   pathExists: (value: string) => boolean,
+  evaluatedAt: Date,
 ) {
   const issueRows = await db.select({
     id: issues.id,
@@ -330,6 +422,7 @@ async function loadAuditSnapshots(
     db.select({
       id: projectWorkspaces.id,
       projectId: projectWorkspaces.projectId,
+      cwd: projectWorkspaces.cwd,
       isPrimary: projectWorkspaces.isPrimary,
     }).from(projectWorkspaces).where(eq(projectWorkspaces.companyId, companyId)),
     db.select({
@@ -337,12 +430,26 @@ async function loadAuditSnapshots(
       companyId: executionWorkspaces.companyId,
       projectId: executionWorkspaces.projectId,
       projectWorkspaceId: executionWorkspaces.projectWorkspaceId,
+      sourceIssueId: executionWorkspaces.sourceIssueId,
       mode: executionWorkspaces.mode,
       strategyType: executionWorkspaces.strategyType,
+      name: executionWorkspaces.name,
       status: executionWorkspaces.status,
       cwd: executionWorkspaces.cwd,
+      repoUrl: executionWorkspaces.repoUrl,
+      baseRef: executionWorkspaces.baseRef,
       branchName: executionWorkspaces.branchName,
+      providerType: executionWorkspaces.providerType,
+      providerRef: executionWorkspaces.providerRef,
+      derivedFromExecutionWorkspaceId: executionWorkspaces.derivedFromExecutionWorkspaceId,
+      lastUsedAt: executionWorkspaces.lastUsedAt,
+      openedAt: executionWorkspaces.openedAt,
       closedAt: executionWorkspaces.closedAt,
+      cleanupEligibleAt: executionWorkspaces.cleanupEligibleAt,
+      cleanupReason: executionWorkspaces.cleanupReason,
+      metadata: executionWorkspaces.metadata,
+      createdAt: executionWorkspaces.createdAt,
+      updatedAt: executionWorkspaces.updatedAt,
     }).from(executionWorkspaces).where(eq(executionWorkspaces.companyId, companyId)),
     db.select({
       id: issueRecoveryActions.id,
@@ -375,7 +482,12 @@ async function loadAuditSnapshots(
     db.select({
       id: agentWakeupRequests.id,
       status: agentWakeupRequests.status,
-      issueId: sql<string | null>`${agentWakeupRequests.payload} ->> 'issueId'`,
+      issueId: sql<string | null>`coalesce(
+        ${agentWakeupRequests.payload} ->> 'issueId',
+        ${agentWakeupRequests.payload} ->> 'taskId',
+        ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'issueId',
+        ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'taskId'
+      )`,
       idempotencyKey: agentWakeupRequests.idempotencyKey,
       createdAt: agentWakeupRequests.createdAt,
     }).from(agentWakeupRequests).where(and(
@@ -389,7 +501,16 @@ async function loadAuditSnapshots(
   const projectWorkspacesById = new Map(projectWorkspaceRows.map((row) => [row.id, row]));
   const primaryByProject = new Map<string, ProjectWorkspaceRow>();
   for (const row of projectWorkspaceRows) if (row.isPrimary && !primaryByProject.has(row.projectId)) primaryByProject.set(row.projectId, row);
-  const executionById = new Map(executionWorkspaceRows.map((row) => [row.id, row]));
+  const deliveryStateById = new Map<string, ExecutionWorkspaceDeliveryState>();
+  const deliveryAssessor = executionWorkspaceService(db as Db);
+  await Promise.all(executionWorkspaceRows.map(async (row) => {
+    const state = await deliveryAssessor.assessDeliveryStateById(row.id).catch(() => "unknown" as const);
+    deliveryStateById.set(row.id, state ?? "unknown");
+  }));
+  const executionById = new Map(executionWorkspaceRows.map((row) => [
+    row.id,
+    { ...row, deliveryState: deliveryStateById.get(row.id) ?? "unknown" },
+  ]));
   const recoveryByIssue = new Map<string, RecoveryActionRow[]>();
   for (const row of recoveryRows) recoveryByIssue.set(row.sourceIssueId, [...(recoveryByIssue.get(row.sourceIssueId) ?? []), row]);
   const latestRunByIssue = new Map<string, HeartbeatRunRow>();
@@ -413,6 +534,7 @@ async function loadAuditSnapshots(
     latestRun: latestRunByIssue.get(issue.id) ?? null,
     remediationWake: remediationWakeByIssue.get(issue.id) ?? null,
     pathExists,
+    evaluatedAt,
   } satisfies ExecutionWorkspaceRemediationSnapshot));
 }
 
@@ -420,9 +542,14 @@ export async function auditExecutionWorkspaceFleet(
   db: Db,
   input: { companyId: string; now?: Date; pathExists?: (value: string) => boolean },
 ): Promise<ExecutionWorkspaceFleetAudit> {
-  const snapshots = await loadAuditSnapshots(db, input.companyId, input.pathExists ?? existsSync);
-  const findings = snapshots
-    .map(classifyExecutionWorkspaceRemediation)
+  const evaluatedAt = input.now ?? new Date();
+  const snapshots = await loadAuditSnapshots(
+    db,
+    input.companyId,
+    input.pathExists ?? existsSync,
+    evaluatedAt,
+  );
+  const findings = (await Promise.all(snapshots.map(classifyExecutionWorkspaceRemediation)))
     .filter((finding): finding is SanitizedExecutionWorkspaceFinding => Boolean(finding))
     .sort((a, b) => (a.issueIdentifier ?? a.issueId).localeCompare(b.issueIdentifier ?? b.issueId));
   const incidentCounts = emptyIncidentCounts();
@@ -430,7 +557,7 @@ export async function auditExecutionWorkspaceFleet(
   return {
     version: 1,
     dryRun: true,
-    generatedAt: (input.now ?? new Date()).toISOString(),
+    generatedAt: evaluatedAt.toISOString(),
     companyId: input.companyId,
     checkedIssueCount: snapshots.length,
     findingCount: findings.length,
@@ -447,9 +574,11 @@ export async function remediateExecutionWorkspaceFleet(
     actorId?: string;
     now?: Date;
     pathExists?: (value: string) => boolean;
+    queueWakeup: QueueExecutionWorkspaceRemediationWake;
   },
 ): Promise<ExecutionWorkspaceFleetRemediation> {
-  const issueRefs = [...new Set(input.issueRefs.map((value) => value.trim()).filter(Boolean))];
+  const normalizedRefs = input.issueRefs.map(normalizeIssueRef);
+  const issueRefs = [...new Set(normalizedRefs.filter((value): value is string => Boolean(value)))];
   if (issueRefs.length === 0) throw new Error("Apply requires at least one explicitly selected issue id or identifier.");
   const now = input.now ?? new Date();
   const before = await auditExecutionWorkspaceFleet(db, {
@@ -460,9 +589,16 @@ export async function remediateExecutionWorkspaceFleet(
   const selected = before.findings.filter((finding) =>
     issueRefs.includes(finding.issueId) || (finding.issueIdentifier ? issueRefs.includes(finding.issueIdentifier) : false));
   const selectedRefSet = new Set(selected.flatMap((finding) => [finding.issueId, finding.issueIdentifier].filter(Boolean) as string[]));
-  const skipped: ExecutionWorkspaceFleetRemediation["skipped"] = issueRefs
+  const skipped: ExecutionWorkspaceFleetRemediation["skipped"] = normalizedRefs
+    .filter((ref): ref is null => ref === null)
+    .map(() => ({ issueId: null, issueIdentifier: null, reason: "invalid_issue_reference" }));
+  skipped.push(...issueRefs
     .filter((ref) => !selectedRefSet.has(ref))
-    .map((ref) => ({ issueId: ref, issueIdentifier: null, reason: "no_open_supported_incident" }));
+    .map((ref) => ({
+      issueId: UUID.test(ref) ? ref : null,
+      issueIdentifier: SAFE_ISSUE_IDENTIFIER.test(ref) ? ref : null,
+      reason: "no_open_supported_incident",
+    })));
   let queuedRunCount = 0;
   let resolvedRecoveryActionCount = 0;
   let remediatedIssueCount = 0;
@@ -493,12 +629,15 @@ export async function remediateExecutionWorkspaceFleet(
       // The dry-run report is a proposal, not authority to clear whatever a
       // later writer may have bound. Reclassify under the issue row lock and
       // require the same sanitized state fingerprint before mutation.
-      const currentFinding = (await loadAuditSnapshots(
-        tx,
-        input.companyId,
-        input.pathExists ?? existsSync,
-      ))
-        .map(classifyExecutionWorkspaceRemediation)
+      const currentFindings = await Promise.all(
+        (await loadAuditSnapshots(
+          tx,
+          input.companyId,
+          input.pathExists ?? existsSync,
+          now,
+        )).map(classifyExecutionWorkspaceRemediation),
+      );
+      const currentFinding = currentFindings
         .find((candidate) => candidate?.issueId === lockedIssue.id) ?? null;
       if (!currentFinding || currentFinding.fingerprint !== finding.fingerprint) {
         return { kind: "skip" as const, reason: "incident_changed_since_audit" };
@@ -508,13 +647,35 @@ export async function remediateExecutionWorkspaceFleet(
         eq(heartbeatRuns.companyId, input.companyId),
         eq(heartbeatRuns.agentId, lockedIssue.assigneeAgentId),
         inArray(heartbeatRuns.status, [...LIVE_RUN_STATUSES]),
-        sql`coalesce(${heartbeatRuns.contextSnapshot} ->> 'issueId', ${heartbeatRuns.contextSnapshot} ->> 'taskId') = ${lockedIssue.id}`,
+        sql`coalesce(
+          ${heartbeatRuns.contextSnapshot} ->> 'issueId',
+          ${heartbeatRuns.contextSnapshot} ->> 'taskId',
+          ${heartbeatRuns.contextSnapshot} -> '_paperclipWakeContext' ->> 'issueId',
+          ${heartbeatRuns.contextSnapshot} -> '_paperclipWakeContext' ->> 'taskId'
+        ) = ${lockedIssue.id}`,
       )).limit(1).then((rows) => rows[0] ?? null);
+      await tx.delete(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, input.companyId),
+        eq(agentWakeupRequests.agentId, lockedIssue.assigneeAgentId),
+        eq(agentWakeupRequests.status, "remediation_pending"),
+        lt(agentWakeupRequests.createdAt, new Date(now.getTime() - REMEDIATION_PENDING_LEASE_MS)),
+        sql`coalesce(
+          ${agentWakeupRequests.payload} ->> 'issueId',
+          ${agentWakeupRequests.payload} ->> 'taskId',
+          ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'issueId',
+          ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'taskId'
+        ) = ${lockedIssue.id}`,
+      ));
       const liveWake = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
         eq(agentWakeupRequests.companyId, input.companyId),
         eq(agentWakeupRequests.agentId, lockedIssue.assigneeAgentId),
         inArray(agentWakeupRequests.status, [...LIVE_WAKE_STATUSES]),
-        sql`coalesce(${agentWakeupRequests.payload} ->> 'issueId', ${agentWakeupRequests.payload} ->> 'taskId') = ${lockedIssue.id}`,
+        sql`coalesce(
+          ${agentWakeupRequests.payload} ->> 'issueId',
+          ${agentWakeupRequests.payload} ->> 'taskId',
+          ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'issueId',
+          ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'taskId'
+        ) = ${lockedIssue.id}`,
       )).limit(1).then((rows) => rows[0] ?? null);
       if (activeRun || liveWake) return { kind: "skip" as const, reason: "issue_already_has_live_execution" };
 
@@ -526,84 +687,40 @@ export async function remediateExecutionWorkspaceFleet(
       )).limit(1).then((rows) => rows[0] ?? null);
       if (priorWake) return { kind: "skip" as const, reason: "remediation_already_queued" };
 
-      await tx.update(issues).set({ executionWorkspaceId: null, updatedAt: now }).where(eq(issues.id, lockedIssue.id));
-      const resolvedActions = currentFinding.recoveryActionIds.length === 0
-        ? []
-        : await tx.update(issueRecoveryActions).set({
-            status: "resolved",
-            outcome: "restored",
-            resolutionNote: "Invalid execution-workspace binding cleared by approved fleet remediation; one fresh run was queued.",
-            wakePolicy: null,
-            monitorPolicy: null,
-            resolvedAt: now,
-            updatedAt: now,
-          }).where(and(
-            eq(issueRecoveryActions.companyId, input.companyId),
-            inArray(issueRecoveryActions.id, currentFinding.recoveryActionIds),
-            inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_STATUSES]),
-          )).returning({ id: issueRecoveryActions.id });
-
-      const safeContext = {
-        issueId: lockedIssue.id,
-        taskId: lockedIssue.id,
-        taskKey: lockedIssue.identifier ?? lockedIssue.id,
-        projectId: lockedIssue.projectId,
-        wakeReason: "execution_workspace_fleet_remediation",
-        workspaceRemediation: {
-          version: 1,
-          fingerprint: currentFinding.fingerprint,
-          incidentClasses: currentFinding.incidentClasses,
-        },
-      };
-      const wake = await tx.insert(agentWakeupRequests).values({
+      // Reserve the remediation in the same transaction that clears the stale
+      // binding. heartbeat.wakeup adopts this marker while holding the same
+      // issue lock, so a fresh audit cannot slip into the clear-to-queue gap.
+      await tx.insert(agentWakeupRequests).values({
         companyId: input.companyId,
         agentId: lockedIssue.assigneeAgentId,
-        source: "automation",
-        triggerDetail: "system",
-        reason: "execution_workspace_fleet_remediation",
-        payload: safeContext,
-        status: "queued",
-        requestedByActorType: "system",
+        source: "manual",
+        triggerDetail: "execution_workspace_fleet_remediation",
+        reason: "execution_workspace_remediation_pending",
+        payload: {
+          issueId: lockedIssue.id,
+          incidentClasses: currentFinding.incidentClasses,
+          fingerprint: currentFinding.fingerprint,
+        },
+        status: "remediation_pending",
+        requestedByActorType: "automation",
         requestedByActorId: input.actorId ?? "execution_workspace_remediation_cli",
         idempotencyKey,
         requestedAt: now,
-        updatedAt: now,
-      }).returning().then((rows) => rows[0]!);
-      const run = await tx.insert(heartbeatRuns).values({
-        companyId: input.companyId,
-        agentId: lockedIssue.assigneeAgentId,
-        invocationSource: "automation",
-        triggerDetail: "system",
-        status: "scheduled_retry",
-        responsibleUserId: lockedIssue.responsibleUserId,
-        wakeupRequestId: wake.id,
-        scheduledRetryAt: now,
-        scheduledRetryAttempt: 1,
-        scheduledRetryReason: "execution_workspace_fleet_remediation",
-        contextSnapshot: safeContext,
-        updatedAt: now,
-      }).returning().then((rows) => rows[0]!);
-      await tx.update(agentWakeupRequests).set({ runId: run.id, updatedAt: now }).where(eq(agentWakeupRequests.id, wake.id));
-      await tx.insert(activityLog).values({
-        companyId: input.companyId,
-        actorType: "system",
-        actorId: input.actorId ?? "execution_workspace_remediation_cli",
-        action: "execution_workspace.fleet_remediated",
-        entityType: "issue",
-        entityId: lockedIssue.id,
-        responsibleUserId: lockedIssue.responsibleUserId,
-        details: {
-          version: 1,
-          incidentClasses: currentFinding.incidentClasses,
-          fingerprint: currentFinding.fingerprint,
-          clearedExecutionWorkspaceBinding: Boolean(lockedIssue.executionWorkspaceId),
-          preservedProjectWorkspaceId: Boolean(lockedIssue.projectWorkspaceId),
-          preservedIssueWorkspacePolicy: Boolean(lockedIssue.executionWorkspaceSettings),
-          queuedRunId: run.id,
-          resolvedRecoveryActionCount: resolvedActions.length,
-        },
       });
-      return { kind: "remediated" as const, resolvedActions: resolvedActions.length };
+      await tx.update(issues).set({ executionWorkspaceId: null, updatedAt: now }).where(eq(issues.id, lockedIssue.id));
+      return {
+        kind: "cleared" as const,
+        agentId: lockedIssue.assigneeAgentId,
+        projectId: lockedIssue.projectId,
+        issueIdentifier: sanitizedIssueIdentifier(lockedIssue.identifier),
+        responsibleUserId: lockedIssue.responsibleUserId,
+        projectWorkspacePreserved: Boolean(lockedIssue.projectWorkspaceId),
+        issueWorkspacePolicyPreserved: Boolean(lockedIssue.executionWorkspaceSettings),
+        recoveryActionIds: currentFinding.recoveryActionIds,
+        fingerprint: currentFinding.fingerprint,
+        incidentClasses: currentFinding.incidentClasses,
+        idempotencyKey,
+      };
     });
 
     if (result.kind === "skip") {
@@ -611,8 +728,65 @@ export async function remediateExecutionWorkspaceFleet(
       continue;
     }
     remediatedIssueCount += 1;
+    const queuedRun = await input.queueWakeup({
+      agentId: result.agentId,
+      issueId: finding.issueId,
+      projectId: result.projectId,
+      issueIdentifier: result.issueIdentifier,
+      fingerprint: result.fingerprint,
+      incidentClasses: result.incidentClasses,
+      idempotencyKey: result.idempotencyKey,
+      actorId: input.actorId ?? "execution_workspace_remediation_cli",
+    }).catch(() => null);
+    if (!queuedRun) {
+      await db.delete(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, input.companyId),
+        eq(agentWakeupRequests.idempotencyKey, result.idempotencyKey),
+        eq(agentWakeupRequests.status, "remediation_pending"),
+      ));
+      skipped.push({
+        issueId: finding.issueId,
+        issueIdentifier: finding.issueIdentifier,
+        reason: "wake_not_queued",
+      });
+      continue;
+    }
     queuedRunCount += 1;
-    resolvedRecoveryActionCount += result.resolvedActions;
+    const resolvedActions = result.recoveryActionIds.length === 0
+      ? []
+      : await db.update(issueRecoveryActions).set({
+          status: "resolved",
+          outcome: "restored",
+          resolutionNote: "Invalid execution-workspace binding cleared by approved fleet remediation; one fresh run was queued.",
+          wakePolicy: null,
+          monitorPolicy: null,
+          resolvedAt: now,
+          updatedAt: now,
+        }).where(and(
+          eq(issueRecoveryActions.companyId, input.companyId),
+          inArray(issueRecoveryActions.id, result.recoveryActionIds),
+          inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_STATUSES]),
+        )).returning({ id: issueRecoveryActions.id });
+    resolvedRecoveryActionCount += resolvedActions.length;
+    await db.insert(activityLog).values({
+      companyId: input.companyId,
+      actorType: "system",
+      actorId: input.actorId ?? "execution_workspace_remediation_cli",
+      action: "execution_workspace.fleet_remediated",
+      entityType: "issue",
+      entityId: finding.issueId,
+      responsibleUserId: result.responsibleUserId,
+      details: {
+        version: 1,
+        incidentClasses: result.incidentClasses,
+        fingerprint: result.fingerprint,
+        clearedExecutionWorkspaceBinding: true,
+        preservedProjectWorkspaceId: result.projectWorkspacePreserved,
+        preservedIssueWorkspacePolicy: result.issueWorkspacePolicyPreserved,
+        queuedRunId: queuedRun.id,
+        resolvedRecoveryActionCount: resolvedActions.length,
+      },
+    });
   }
 
   const after = await auditExecutionWorkspaceFleet(db, {

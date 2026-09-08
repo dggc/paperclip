@@ -24818,6 +24818,48 @@ export function heartbeatService(
         await tx.execute(
           sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
         );
+        const executionWorkspaceRemediationIdempotencyKey =
+          opts.idempotencyKey?.startsWith("execution-workspace-remediation:") === true
+            ? opts.idempotencyKey
+            : null;
+        const isExecutionWorkspaceRemediationWake =
+          executionWorkspaceRemediationIdempotencyKey !== null;
+        if (executionWorkspaceRemediationIdempotencyKey) {
+          const existingWake = await tx
+            .select({
+              id: agentWakeupRequests.id,
+              runId: agentWakeupRequests.runId,
+              status: agentWakeupRequests.status,
+            })
+            .from(agentWakeupRequests)
+            .where(and(
+              eq(agentWakeupRequests.companyId, agent.companyId),
+              eq(
+                agentWakeupRequests.idempotencyKey,
+                executionWorkspaceRemediationIdempotencyKey,
+              ),
+              ne(agentWakeupRequests.status, "skipped"),
+            ))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          if (existingWake?.status === "remediation_pending") {
+            await tx.delete(agentWakeupRequests).where(and(
+              eq(agentWakeupRequests.id, existingWake.id),
+              eq(agentWakeupRequests.status, "remediation_pending"),
+            ));
+          } else {
+            if (existingWake?.runId) {
+              const existingRun = await tx
+                .select()
+                .from(heartbeatRuns)
+                .where(eq(heartbeatRuns.id, existingWake.runId))
+                .limit(1)
+                .then((rows) => rows[0] ?? null);
+              if (existingRun) return { kind: "coalesced" as const, run: existingRun };
+            }
+            if (existingWake) return { kind: "skipped" as const };
+          }
+        }
 
         const issue = await tx
           .select({
@@ -25382,8 +25424,14 @@ export function heartbeatService(
             }) &&
             activeExecutionRun.status === "running" &&
             isSameExecutionAgent;
+          // A remediation reservation was created while holding this issue
+          // lock. Coalesce it onto any DB-active same-agent run even during
+          // the brief handoff before that run enters the in-memory registry;
+          // otherwise a concurrent ordinary wake can produce a second run.
           const availableActiveExecutionRun = isSameExecutionAgent
-            ? filterZombieCoalesceTarget(activeExecutionRun, liveRunExecutions)
+            ? isExecutionWorkspaceRemediationWake
+              ? activeExecutionRun
+              : filterZombieCoalesceTarget(activeExecutionRun, liveRunExecutions)
             : activeExecutionRun;
 
           if (

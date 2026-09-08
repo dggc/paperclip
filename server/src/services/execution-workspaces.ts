@@ -2256,6 +2256,22 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       );
     },
 
+    // Read-only delivery assessment for fleet audits. Unlike getById this does
+    // not refresh runtime-service health or persist anything; it only inspects
+    // the git/PR metadata already used by the normal reuse path.
+    assessDeliveryStateById: async (id: string) => {
+      const row = await db
+        .select()
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, id))
+        .then((rows) => rows[0] ?? null);
+      if (!row) return null;
+      const { git } = await (opts.inspectGitCloseReadiness ?? inspectGitCloseReadiness)(
+        toExecutionWorkspace(row),
+      );
+      return (await assessDelivery(row, git)).deliveryState;
+    },
+
     getCloseReadiness: async (id: string): Promise<ExecutionWorkspaceCloseReadiness | null> => {
       const workspace = await db
         .select()

@@ -43,6 +43,11 @@ export const agentWakeupRequests = pgTable(
     dispositionRepairIdempotencyUq: uniqueIndex("agent_wakeup_requests_disposition_repair_idempotency_uq")
       .on(table.companyId, table.idempotencyKey)
       .where(sql`${table.idempotencyKey} LIKE 'issue_disposition_repair:%' AND ${table.status} <> 'skipped'`),
+    executionWorkspaceRemediationIdempotencyUq: uniqueIndex(
+      "agent_wakeup_requests_execution_workspace_remediation_idempotency_uq",
+    )
+      .on(table.companyId, table.idempotencyKey)
+      .where(sql`${table.idempotencyKey} LIKE 'execution-workspace-remediation:%' AND ${table.status} <> 'skipped'`),
     questionResponseDeliveryIdempotencyUq: uniqueIndex(
       "agent_wakeup_requests_question_response_delivery_idempotency_uq",
     )
