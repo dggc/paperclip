@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { and, desc, eq, inArray, lt, ne, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, lt, ne, or, sql } from "drizzle-orm";
 import {
   activityLog,
   agentWakeupRequests,
@@ -580,25 +580,57 @@ export async function remediateExecutionWorkspaceFleet(
   const normalizedRefs = input.issueRefs.map(normalizeIssueRef);
   const issueRefs = [...new Set(normalizedRefs.filter((value): value is string => Boolean(value)))];
   if (issueRefs.length === 0) throw new Error("Apply requires at least one explicitly selected issue id or identifier.");
+  const uuidRefs = issueRefs.filter((ref) => UUID.test(ref));
+  const identifierRefs = issueRefs.filter((ref) => SAFE_ISSUE_IDENTIFIER.test(ref));
+  const referencePredicates = [
+    ...(uuidRefs.length > 0 ? [inArray(issues.id, uuidRefs)] : []),
+    ...(identifierRefs.length > 0 ? [inArray(issues.identifier, identifierRefs)] : []),
+  ];
+  const resolvedIssueRows = await db.select({
+    id: issues.id,
+    identifier: issues.identifier,
+  }).from(issues).where(and(
+    eq(issues.companyId, input.companyId),
+    referencePredicates.length === 1
+      ? referencePredicates[0]
+      : or(...referencePredicates),
+  ));
+  const resolvedIssueByRef = new Map<string, (typeof resolvedIssueRows)[number]>();
+  for (const issue of resolvedIssueRows) {
+    resolvedIssueByRef.set(issue.id.toLowerCase(), issue);
+    const identifier = sanitizedIssueIdentifier(issue.identifier);
+    if (identifier) resolvedIssueByRef.set(identifier, issue);
+  }
   const now = input.now ?? new Date();
   const before = await auditExecutionWorkspaceFleet(db, {
     companyId: input.companyId,
     now,
     pathExists: input.pathExists,
   });
-  const selected = before.findings.filter((finding) =>
-    issueRefs.includes(finding.issueId) || (finding.issueIdentifier ? issueRefs.includes(finding.issueIdentifier) : false));
-  const selectedRefSet = new Set(selected.flatMap((finding) => [finding.issueId, finding.issueIdentifier].filter(Boolean) as string[]));
+  const resolvedIssueIds = new Set(resolvedIssueRows.map((issue) => issue.id));
+  const selected = before.findings.filter((finding) => resolvedIssueIds.has(finding.issueId));
+  const selectedIssueIds = new Set(selected.map((finding) => finding.issueId));
   const skipped: ExecutionWorkspaceFleetRemediation["skipped"] = normalizedRefs
     .filter((ref): ref is null => ref === null)
     .map(() => ({ issueId: null, issueIdentifier: null, reason: "invalid_issue_reference" }));
-  skipped.push(...issueRefs
-    .filter((ref) => !selectedRefSet.has(ref))
-    .map((ref) => ({
-      issueId: UUID.test(ref) ? ref : null,
-      issueIdentifier: SAFE_ISSUE_IDENTIFIER.test(ref) ? ref : null,
-      reason: "no_open_supported_incident",
-    })));
+  for (const ref of issueRefs) {
+    const resolvedIssue = resolvedIssueByRef.get(ref);
+    if (!resolvedIssue) {
+      skipped.push({
+        issueId: null,
+        issueIdentifier: null,
+        reason: "invalid_issue_reference",
+      });
+      continue;
+    }
+    if (!selectedIssueIds.has(resolvedIssue.id)) {
+      skipped.push({
+        issueId: resolvedIssue.id,
+        issueIdentifier: sanitizedIssueIdentifier(resolvedIssue.identifier),
+        reason: "no_open_supported_incident",
+      });
+    }
+  }
   let queuedRunCount = 0;
   let resolvedRecoveryActionCount = 0;
   let remediatedIssueCount = 0;

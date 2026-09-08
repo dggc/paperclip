@@ -35,7 +35,12 @@ import {
   parseProjectExecutionWorkspacePolicy,
   resolveExecutionWorkspaceMode,
 } from "../services/execution-workspace-policy.js";
-import { evaluateExecutionWorkspaceReuseCompatibility, heartbeatService } from "../services/heartbeat.js";
+import {
+  evaluateExecutionWorkspaceReuseCompatibility,
+  heartbeatService,
+  provisionExecutionWorkspaceForFreshnessDecision,
+  resolveExecutionWorkspaceConfigFreshness,
+} from "../services/heartbeat.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { issueService } from "../services/issues.js";
 import { realizeExecutionWorkspace } from "../services/workspace-runtime.js";
@@ -415,7 +420,7 @@ describe("isolated workspace nine-scenario regression matrix", () => {
     }
   });
 
-  it("5. reports archived or missing reuse as non-reusable", async () => {
+  it("5. replaces merged, archived, or missing reuse through production provisioning", async () => {
     const repoRoot = await createSyntheticRepository();
     try {
       const realized = await realizeSyntheticWorktree({
@@ -433,25 +438,68 @@ describe("isolated workspace nine-scenario regression matrix", () => {
         expectedRepoRoot: repoRoot,
         inspectFilesystem: true,
       };
-      await expect(evaluateExecutionWorkspaceReuseCompatibility({
-        ...common,
-        workspace: { ...active, deliveryState: "merged_by_ancestry" as const },
-      })).resolves.toMatchObject({ reusable: false, reason: "workspace_merged:merged_by_ancestry" });
-      await expect(evaluateExecutionWorkspaceReuseCompatibility({
-        ...common,
-        workspace: { ...active, status: "archived" as const, closedAt: now },
-      })).resolves.toMatchObject({ reusable: false, reason: "workspace_archived" });
-      await expect(evaluateExecutionWorkspaceReuseCompatibility({
-        ...common,
-        workspace: {
-          ...active,
-          cwd: path.join(repoRoot, "missing"),
-          providerRef: path.join(repoRoot, "missing"),
+      const cases = [
+        {
+          name: "merged",
+          workspace: { ...active, deliveryState: "merged_by_ancestry" as const },
+          expectedReason: "workspace_merged:merged_by_ancestry",
         },
-      })).resolves.toMatchObject({
-        reusable: false,
-        reason: expect.stringContaining("workspace_worktree_unavailable"),
-      });
+        {
+          name: "archived",
+          workspace: { ...active, status: "archived" as const, closedAt: now },
+          expectedReason: "workspace_archived",
+        },
+        {
+          name: "missing",
+          workspace: {
+            ...active,
+            cwd: path.join(repoRoot, "missing"),
+            providerRef: path.join(repoRoot, "missing"),
+          },
+          expectedReason: "workspace_worktree_unavailable",
+        },
+      ];
+      const replacementPaths: string[] = [];
+      for (const [index, testCase] of cases.entries()) {
+        const compatibility = await evaluateExecutionWorkspaceReuseCompatibility({
+          ...common,
+          workspace: testCase.workspace,
+        });
+        expect(compatibility).toMatchObject({
+          reusable: false,
+          reason: expect.stringContaining(testCase.expectedReason),
+        });
+        const freshness = resolveExecutionWorkspaceConfigFreshness({
+          hasExistingWorkspace: compatibility.reusable,
+          existingWorkspaceMetadata: null,
+          nextMetadata: null,
+        });
+        const replacement = await provisionExecutionWorkspaceForFreshnessDecision({
+          requestedShouldReuseExisting: true,
+          existingExecutionWorkspaceId: active.id,
+          issueRef: { id: `issue-5-${testCase.name}`, identifier: `SYN-${50 + index}` },
+          runId: `run-5-${testCase.name}`,
+          workspaceConfigFreshness: freshness,
+          restoreExistingWorkspace: null,
+          realizeWorkspace: async () => {
+            throw new Error("Non-reusable workspaces must not use the ordinary realization path");
+          },
+          allowFreshWorkspaceOnNonReusable: true,
+          workspaceNotReusableReason: compatibility.reason,
+          realizeFreshWorkspace: () => realizeSyntheticWorktree({
+            repoRoot,
+            issueId: `issue-5-${testCase.name}`,
+            identifier: `SYN-${50 + index}`,
+            title: `Fresh ${testCase.name} replacement`,
+          }),
+        });
+        expect(replacement.reusedExecutionWorkspace).toBeNull();
+        expect(replacement.policy.shouldRestoreExistingWorkspace).toBe(false);
+        expect(replacement.executionWorkspace.created).toBe(true);
+        expect(replacement.executionWorkspace.worktreePath).not.toBe(realized.worktreePath);
+        replacementPaths.push(replacement.executionWorkspace.worktreePath!);
+      }
+      expect(new Set(replacementPaths).size).toBe(cases.length);
       const wrongRepoRoot = await createSyntheticRepository();
       try {
         await expect(evaluateExecutionWorkspaceReuseCompatibility({
@@ -465,15 +513,6 @@ describe("isolated workspace nine-scenario regression matrix", () => {
       } finally {
         await rm(wrongRepoRoot, { recursive: true, force: true });
       }
-
-      const fresh = await realizeSyntheticWorktree({
-        repoRoot,
-        issueId: "issue-5-fresh",
-        identifier: "SYN-50",
-        title: "Fresh replacement",
-      });
-      expect(fresh.created).toBe(true);
-      expect(fresh.worktreePath).not.toBe(realized.worktreePath);
     } finally {
       await rm(repoRoot, { recursive: true, force: true });
     }
@@ -504,10 +543,12 @@ describe("isolated workspace nine-scenario regression matrix", () => {
         executionWorkspacePreference: "https://private.example/preference",
       }),
       executionWorkspace: executionWorkspaceRow({
+        name: "private-workspace-name",
         mode: "/private/mode",
         strategyType: "ssh://private.example/strategy",
         providerType: "private-provider diagnostics",
         status: "raw run output",
+        branchName: "private-branch-name",
         closedAt: now,
       }),
       latestRun: {
@@ -523,7 +564,8 @@ describe("isolated workspace nine-scenario regression matrix", () => {
     expect(encoded).not.toContain("private.example");
     expect(encoded).not.toContain("must-not-leak");
     expect(encoded).not.toContain("Synthetic issue");
-    expect(encoded).not.toContain("SYN-1-isolated");
+    expect(encoded).not.toContain("private-workspace-name");
+    expect(encoded).not.toContain("private-branch-name");
     expect(encoded).not.toContain("raw run output");
     expect(encoded).not.toContain("private-provider");
     expect(encoded).not.toContain("raw-diagnostic");
@@ -727,6 +769,56 @@ describeEmbeddedPostgres("database-backed isolated-workspace matrix", () => {
 
   afterAll(async () => {
     await tempDb?.cleanup();
+  });
+
+  it("fails closed for malformed and valid-looking nonexistent apply references", async () => {
+    const companyId = randomUUID();
+    const otherCompanyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Synthetic reference company",
+      issuePrefix: `RF${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(companies).values({
+      id: otherCompanyId,
+      name: "Private other company",
+      issuePrefix: `OT${otherCompanyId.replaceAll("-", "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId: otherCompanyId,
+      title: "Private cross-company issue name",
+      status: "todo",
+      priority: "medium",
+      issueNumber: 999,
+      identifier: "SYN-999",
+    });
+
+    const queueWakeup = vi.fn(async () => ({ id: "must-not-run" }));
+    const report = await remediateExecutionWorkspaceFleet(db, {
+      companyId,
+      issueRefs: ["../../private-issue-name", "SYN-998", "SYN-999"],
+      now,
+      queueWakeup,
+    });
+
+    expect(report).toMatchObject({
+      requestedIssueCount: 2,
+      remediatedIssueCount: 0,
+      queuedRunCount: 0,
+      skipped: [
+        { issueId: null, issueIdentifier: null, reason: "invalid_issue_reference" },
+        { issueId: null, issueIdentifier: null, reason: "invalid_issue_reference" },
+        { issueId: null, issueIdentifier: null, reason: "invalid_issue_reference" },
+      ],
+    });
+    expect(queueWakeup).not.toHaveBeenCalled();
+    expect(JSON.stringify(report)).not.toContain("private-issue-name");
+    expect(JSON.stringify(report)).not.toContain("SYN-998");
+    expect(JSON.stringify(report)).not.toContain("SYN-999");
+    expect(JSON.stringify(report)).not.toContain("Private cross-company issue name");
   });
 
   it("6. project, parent, and child creation preserve the resolved project workspace identity", async () => {
