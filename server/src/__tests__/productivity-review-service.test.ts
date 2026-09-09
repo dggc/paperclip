@@ -5,15 +5,20 @@ import {
   activityLog,
   agentWakeupRequests,
   agents,
+  completionContracts,
   companies,
   createDb,
   executionWorkspaces,
   goals,
   heartbeatRuns,
   issueComments,
+  issueRelations,
   issues,
+  nativeRunFinalizations,
+  nativeRunResults,
   projects,
   projectWorkspaces,
+  workAssessments,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -33,6 +38,13 @@ import {
   PRODUCTIVITY_REVIEW_RESOLVED_WAKE_REASON,
 } from "../services/issues.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
+import {
+  commitNativeStatusDecision,
+} from "../services/native-runtime/status-decision-committer.ts";
+import {
+  NATIVE_STATUS_ARBITER_POLICY_VERSION,
+  type NativeStatusDecision,
+} from "../services/native-runtime/status-arbiter.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -465,6 +477,140 @@ describeEmbeddedPostgres("productivity review service", () => {
       agentId: seeded.coderId,
       now,
     })).held).toBe(false);
+  });
+
+  it("queues exactly one source continuation when native finalization completes a productivity review", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+    await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review).toBeDefined();
+    await db.update(issues).set({
+      status: "blocked",
+      blockedTransitionAt: now,
+    }).where(eq(issues.id, seeded.issueId));
+    await db.insert(issueRelations).values({
+      companyId: seeded.companyId,
+      issueId: review!.id,
+      relatedIssueId: seeded.issueId,
+      type: "blocks",
+    });
+
+    const runId = randomUUID();
+    const contractId = randomUUID();
+    const resultId = randomUUID();
+    const assessmentId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: seeded.companyId,
+      agentId: seeded.managerId,
+      status: "running",
+      runtimeMode: "native",
+      runtimeModeResolvedAt: now,
+      nativeIssueId: review!.id,
+      contextSnapshot: { issueId: review!.id },
+      completionContractId: contractId,
+      completionContractSha256: `contract:${review!.id}`,
+    });
+    await db.insert(completionContracts).values({
+      id: contractId,
+      companyId: seeded.companyId,
+      issueId: review!.id,
+      revision: 1,
+      schemaVersion: "paperclip.completion-contract.v1",
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      risk: "standard",
+      completionAuthority: "server_arbiter",
+      incompleteCriteriaPolicy: "preserve_non_terminal",
+      contractJson: { revision: "productivity-review-native-v1", criteria: [] },
+      canonicalSha256: `contract:${review!.id}`,
+      createdByActorType: "system",
+      createdByActorId: "productivity-review-test",
+    });
+    await db.insert(nativeRunResults).values({
+      id: resultId,
+      companyId: seeded.companyId,
+      issueId: review!.id,
+      runId,
+      completionContractId: contractId,
+      serverFingerprint: `fingerprint:${review!.id}`,
+      schemaStatus: "accepted",
+      resultJson: { result: { summary: "Review disposition recorded." } },
+      canonicalSha256: `result:${review!.id}`,
+    });
+    await db.insert(workAssessments).values({
+      id: assessmentId,
+      companyId: seeded.companyId,
+      issueId: review!.id,
+      runId,
+      contractId,
+      resultId,
+      triggerKind: "native_result",
+      triggerActorCompanyId: seeded.companyId,
+      priorIssueStatus: "todo",
+      priorStatusVersion: 0,
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      assessmentJson: { productivityReview: true },
+      inputDigest: `assessment:${review!.id}`,
+    });
+    await db.insert(nativeRunFinalizations).values({
+      runId,
+      companyId: seeded.companyId,
+      issueId: review!.id,
+      phase: "assessing",
+      resultId,
+      assessmentId,
+    });
+
+    const decision: NativeStatusDecision = {
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      statusAction: "done",
+      toStatus: "done",
+      reasonCode: "productivity_review_completed",
+      unblockDescriptor: null,
+      effects: [],
+    };
+    const input = {
+      db,
+      companyId: seeded.companyId,
+      issueId: review!.id,
+      runId,
+      assessmentId,
+      priorStatus: "todo",
+      priorStatusVersion: 0,
+      priorDecisionId: null,
+      decision,
+    };
+
+    const committed = await commitNativeStatusDecision(input);
+    const replayed = await commitNativeStatusDecision(input);
+    expect(committed.replayed).toBe(false);
+    expect(replayed.replayed).toBe(true);
+
+    const sourceWakes = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.companyId, seeded.companyId));
+    expect(sourceWakes).toHaveLength(1);
+    expect(sourceWakes[0]).toMatchObject({
+      agentId: seeded.coderId,
+      reason: PRODUCTIVITY_REVIEW_RESOLVED_WAKE_REASON,
+      idempotencyKey: `productivity-review-resolved:${review!.id}`,
+      payload: expect.objectContaining({
+        issueId: seeded.issueId,
+        resolvedProductivityReviewIssueId: review!.id,
+      }),
+    });
   });
 
   it("refreshes open productivity reviews only once per interval and caps refresh comments", async () => {

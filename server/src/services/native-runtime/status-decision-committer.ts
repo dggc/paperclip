@@ -25,6 +25,7 @@ import {
 } from "./status-arbiter.js";
 import { nativeSha256 } from "./canonical.js";
 import { issueService } from "../issues.js";
+import { shouldEnqueueGenericTerminalWakeForTarget } from "../issue-terminal-wake-policy.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { buildIssueBlockersResolvedWakeIdempotencyKey } from "../issue-dependency-wakeups.js";
@@ -1187,7 +1188,7 @@ export async function commitNativeStatusDecision(input: {
           const summary = record(record(rows[0]?.resultJson).result).summary;
           return typeof summary === "string" && summary.trim().length > 0 ? summary.trim() : null;
         });
-      const parent = issue.parentId
+      const parent = issue.parentId && shouldEnqueueGenericTerminalWakeForTarget(issue, issue.parentId)
         ? await issueSvc.getWakeableParentAfterChildCompletion(issue.parentId, {
             issueId: input.issueId,
             summary: completedResultSummary,
@@ -1197,6 +1198,7 @@ export async function commitNativeStatusDecision(input: {
         ? dependents.some((dependent) => dependent.id === parent.id)
         : false;
       for (const dependent of dependents) {
+        if (!shouldEnqueueGenericTerminalWakeForTarget(issue, dependent.id)) continue;
         const isCompletedChildParent = parent?.id === dependent.id;
         const idempotencyKey = isCompletedChildParent
           ? `issue_children_completed:${dependent.id}:${input.issueId}`

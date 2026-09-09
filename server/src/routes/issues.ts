@@ -211,6 +211,7 @@ import {
   readAcceptedPlanConfirmationTarget,
   type IssuePostCommitAction,
 } from "../services/issues.js";
+import { shouldEnqueueGenericTerminalWakeForTarget } from "../services/issue-terminal-wake-policy.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
 import { stalledReviewDecisionService } from "../services/stalled-review-decisions.js";
 import { environmentService } from "../services/environments.js";
@@ -11369,6 +11370,7 @@ export function issueRoutes(
       if (becameDone) {
         const dependents = await svc.listWakeableBlockedDependents(issue.id);
         for (const dependent of dependents) {
+          if (!shouldEnqueueGenericTerminalWakeForTarget(issue, dependent.id)) continue;
           await addDependencyResolvedWakeup({
             agentId: dependent.assigneeAgentId,
             dependentIssueId: dependent.id,
@@ -11478,7 +11480,7 @@ export function issueRoutes(
       if (
         becameTerminal &&
         issue.parentId &&
-        issue.originKind !== RECOVERY_ORIGIN_KINDS.issueProductivityReview
+        shouldEnqueueGenericTerminalWakeForTarget(issue, issue.parentId)
       ) {
         const parent = await svc.getWakeableParentAfterChildCompletion(issue.parentId);
         if (parent) {
@@ -13963,6 +13965,7 @@ export function issueRoutes(
       if (becameDone) {
         const dependents = await svc.listWakeableBlockedDependents(currentIssue.id);
         for (const dependent of dependents) {
+          if (!shouldEnqueueGenericTerminalWakeForTarget(currentIssue, dependent.id)) continue;
           await addDependencyResolvedWakeup({
             agentId: dependent.assigneeAgentId,
             dependentIssueId: dependent.id,
@@ -13989,7 +13992,11 @@ export function issueRoutes(
         });
         await destroyReusableSandboxLeasesForTerminalIssue(currentIssue);
       }
-      if (becameTerminal && currentIssue.parentId) {
+      if (
+        becameTerminal &&
+        currentIssue.parentId &&
+        shouldEnqueueGenericTerminalWakeForTarget(currentIssue, currentIssue.parentId)
+      ) {
         const parent = await svc.getWakeableParentAfterChildCompletion(currentIssue.parentId);
         if (parent) {
           addWakeup(parent.assigneeAgentId, {

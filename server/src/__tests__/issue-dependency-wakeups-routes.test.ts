@@ -453,6 +453,14 @@ describe("issue dependency wakeups in issue routes", () => {
       childIssueSummaries: [],
       childIssueSummaryTruncated: false,
     });
+    mockIssueService.listWakeableBlockedDependents.mockResolvedValue([
+      {
+        id: "source-1",
+        assigneeAgentId: "agent-1",
+        blockerIssueIds: ["review-1"],
+        blockedTransitionAt: new Date("2026-04-28T12:00:00.000Z"),
+      },
+    ]);
 
     const res = await request(await createApp()).patch("/api/issues/review-1").send({ status: "done" });
 
@@ -461,7 +469,9 @@ describe("issue dependency wakeups in issue routes", () => {
     expect(mockIssueService.getWakeableParentAfterChildCompletion).not.toHaveBeenCalled();
     expect(mockWakeup).not.toHaveBeenCalledWith(
       "agent-1",
-      expect.objectContaining({ reason: "issue_children_completed" }),
+      expect.objectContaining({
+        reason: expect.stringMatching(/^(issue_children_completed|issue_blockers_resolved)$/),
+      }),
     );
   });
 

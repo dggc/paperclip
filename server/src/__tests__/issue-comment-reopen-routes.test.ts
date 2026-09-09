@@ -2638,6 +2638,92 @@ describe.sequential("issue comment reopen routes", () => {
     );
   });
 
+  it("does not add a generic parent wake when comment auto-approval completes a productivity review", async () => {
+    const reviewerAgentId = "33333333-3333-4333-8333-333333333333";
+    const sourceAgentId = "22222222-2222-4222-8222-222222222222";
+    const policy = await normalizePolicy({
+      stages: [
+        {
+          id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          type: "review",
+          participants: [{ type: "agent", agentId: reviewerAgentId }],
+        },
+      ],
+    })!;
+    const issue = {
+      ...makeIssue("todo"),
+      status: "in_review",
+      assigneeAgentId: reviewerAgentId,
+      parentId: "source-issue-1",
+      originKind: "issue_productivity_review",
+      originId: "source-issue-1",
+      executionPolicy: policy,
+      executionState: {
+        status: "pending",
+        currentStageId: policy.stages[0].id,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: reviewerAgentId },
+        returnAssignee: { type: "agent", agentId: sourceAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    };
+    const reviewBody = "kind: review\ndecision: approved\nsummary: review complete";
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-productivity-review",
+      issueId: issue.id,
+      companyId: issue.companyId,
+      body: reviewBody,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      authorAgentId: reviewerAgentId,
+      authorUserId: null,
+    });
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      executionState: patch.executionState,
+      assigneeAgentId: sourceAgentId,
+      status: "done",
+      completedAt: new Date(),
+      updatedAt: new Date(),
+    }));
+    mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue({
+      id: issue.parentId,
+      assigneeAgentId: sourceAgentId,
+      childIssueIds: [issue.id],
+      childIssueSummaries: [],
+      childIssueSummaryTruncated: false,
+    });
+    mockIssueService.listWakeableBlockedDependents.mockResolvedValue([
+      {
+        id: issue.originId,
+        assigneeAgentId: sourceAgentId,
+        blockerIssueIds: [issue.id],
+        blockedTransitionAt: new Date("2026-04-28T12:00:00.000Z"),
+      },
+    ]);
+
+    const res = await request(
+      await installActor(createApp(), agentActor(reviewerAgentId)),
+    )
+      .post(`/api/issues/${issue.id}/comments`)
+      .send({ body: reviewBody });
+
+    expect(res.status).toBe(201);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(mockIssueService.getWakeableParentAfterChildCompletion).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+      sourceAgentId,
+      expect.objectContaining({
+        reason: expect.stringMatching(/^(issue_children_completed|issue_blockers_resolved)$/),
+      }),
+    );
+  });
+
   it("auto-approves a reviewer comment and wakes dependents when the final blocker resolves", async () => {
     const reviewerAgentId = "33333333-3333-4333-8333-333333333333";
     const dependentAgentId = "44444444-4444-4444-8444-444444444444";
