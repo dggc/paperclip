@@ -102,7 +102,7 @@ describe("workspace-ready comment builders", () => {
     expect(presentation.title).toBe("Workspace ready");
   });
 
-  it("builds structured workspace and service sections without an empty warnings section", () => {
+  it("builds structured workspace and count-only service sections without an empty warnings section", () => {
     const input = {
       workspace: workspace(),
       runtimeServices: [
@@ -131,25 +131,11 @@ describe("workspace-ready comment builders", () => {
         {
           title: "Services",
           rows: [
-            { type: "key_value", label: "web", value: "http://localhost:3100" },
-            { type: "key_value", label: "worker", value: "running (reused)" },
+            { type: "key_value", label: "Running services", value: "2" },
+            { type: "key_value", label: "Reused services", value: "1" },
           ],
         },
       ],
-    });
-  });
-
-  it("keeps service labels within the comment metadata boundary", () => {
-    const metadata = buildWorkspaceReadyMetadata({
-      workspace: workspace(),
-      runtimeServices: [runtimeService({ serviceName: `  ${"s".repeat(150)}  ` })],
-    });
-    const serviceLabel = metadata.sections[1]?.rows[0];
-
-    expect(serviceLabel).toEqual({
-      type: "key_value",
-      label: `${"s".repeat(119)}…`,
-      value: "http://localhost:3100",
     });
   });
 
@@ -190,8 +176,17 @@ describe("workspace-ready comment builders", () => {
       "- Worktree present: `yes`",
       "- Branch present: `yes`",
       "- Warning count: `1` (inspect the linked run for details)",
-      "- Service: web: http://localhost:3100 (reused)",
+      "- Running services: `1`",
+      "- Reused services: `1`",
     ].join("\n"));
+
+    expect(buildWorkspaceReadyMetadata(input).sections[1]).toEqual({
+      title: "Services",
+      rows: [
+        { type: "key_value", label: "Running services", value: "1" },
+        { type: "key_value", label: "Reused services", value: "1" },
+      ],
+    });
 
     const issueFacingPayload = JSON.stringify({
       body,
@@ -208,5 +203,46 @@ describe("workspace-ready comment builders", () => {
     ]) {
       expect(issueFacingPayload).not.toContain(sensitiveValue);
     }
+  });
+
+  it("does not project runtime-service-controlled labels or URLs into the issue payload", () => {
+    const branchNameCanary = "private/customer-branch";
+    const repositoryUrlCanary = "ssh://git.example.test/private/project.git";
+    const absolutePathCanary = "/private/repos/customer/worktrees/change";
+    const diagnosticCanary = "raw-provider-output";
+    const input = {
+      workspace: workspace(),
+      runtimeServices: [
+        runtimeService({ serviceName: branchNameCanary, url: repositoryUrlCanary }),
+        runtimeService({
+          id: "sensitive-service-id",
+          serviceName: absolutePathCanary,
+          url: `https://example.test/?diagnostic=${diagnosticCanary}`,
+          reused: true,
+        }),
+      ],
+    };
+
+    const issueFacingPayload = JSON.stringify({
+      body: buildWorkspaceReadyComment(input),
+      presentation: buildWorkspaceReadyPresentation(input),
+      metadata: buildWorkspaceReadyMetadata(input),
+    });
+
+    for (const sensitiveValue of [
+      branchNameCanary,
+      repositoryUrlCanary,
+      absolutePathCanary,
+      diagnosticCanary,
+    ]) {
+      expect(issueFacingPayload).not.toContain(sensitiveValue);
+    }
+    expect(buildWorkspaceReadyMetadata(input).sections[1]).toEqual({
+      title: "Services",
+      rows: [
+        { type: "key_value", label: "Running services", value: "2" },
+        { type: "key_value", label: "Reused services", value: "1" },
+      ],
+    });
   });
 });

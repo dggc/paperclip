@@ -8789,15 +8789,6 @@ type WorkspaceReadyCommentInput = {
   runtimeServices: RuntimeServiceRef[];
 };
 
-const COMMENT_METADATA_LABEL_MAX_LENGTH = 120;
-
-function workspaceReadyServiceLabel(serviceName: string): string {
-  const label = serviceName.trim() || "Service";
-  return label.length > COMMENT_METADATA_LABEL_MAX_LENGTH
-    ? `${label.slice(0, COMMENT_METADATA_LABEL_MAX_LENGTH - 1)}…`
-    : label;
-}
-
 function workspaceReadyEffectiveMode(
   workspace: RealizedExecutionWorkspace,
 ): "isolated_workspace" | "shared_workspace" | "agent_home" | "task_session" {
@@ -8826,6 +8817,7 @@ export function buildWorkspaceReadyMetadata(
 ): IssueCommentMetadata {
   const hasWorktree = Boolean(input.workspace.worktreePath);
   const hasBranch = Boolean(input.workspace.branchName);
+  const reusedServiceCount = input.runtimeServices.filter((service) => service.reused).length;
   const workspaceRows: IssueCommentMetadata["sections"][number]["rows"] = [
     { type: "key_value", label: "Mode", value: workspaceReadyEffectiveMode(input.workspace) },
     { type: "key_value", label: "Strategy", value: input.workspace.strategy },
@@ -8839,19 +8831,18 @@ export function buildWorkspaceReadyMetadata(
         }]
       : []),
   ];
-  const serviceRows: IssueCommentMetadata["sections"][number]["rows"] = input.runtimeServices.map(
-    (service) => ({
-      type: "key_value",
-      label: workspaceReadyServiceLabel(service.serviceName),
-      value: `${service.url ?? "running"}${service.reused ? " (reused)" : ""}`,
-    }),
-  );
+  const serviceRows: IssueCommentMetadata["sections"][number]["rows"] = [
+    { type: "key_value", label: "Running services", value: String(input.runtimeServices.length) },
+    ...(reusedServiceCount > 0
+      ? [{ type: "key_value" as const, label: "Reused services", value: String(reusedServiceCount) }]
+      : []),
+  ];
 
   return {
     version: 1,
     sections: [
       { title: "Workspace", rows: workspaceRows },
-      ...(serviceRows.length > 0 ? [{ title: "Services", rows: serviceRows }] : []),
+      ...(input.runtimeServices.length > 0 ? [{ title: "Services", rows: serviceRows }] : []),
     ],
   };
 }
@@ -8865,10 +8856,12 @@ export function buildWorkspaceReadyComment(input: WorkspaceReadyCommentInput) {
   if (input.workspace.warnings.length > 0) {
     lines.push(`- Warning count: \`${input.workspace.warnings.length}\` (inspect the linked run for details)`);
   }
-  for (const service of input.runtimeServices) {
-    const detail = service.url ? `${service.serviceName}: ${service.url}` : `${service.serviceName}: running`;
-    const suffix = service.reused ? " (reused)" : "";
-    lines.push(`- Service: ${detail}${suffix}`);
+  if (input.runtimeServices.length > 0) {
+    const reusedServiceCount = input.runtimeServices.filter((service) => service.reused).length;
+    lines.push(`- Running services: \`${input.runtimeServices.length}\``);
+    if (reusedServiceCount > 0) {
+      lines.push(`- Reused services: \`${reusedServiceCount}\``);
+    }
   }
   return lines.join("\n");
 }
