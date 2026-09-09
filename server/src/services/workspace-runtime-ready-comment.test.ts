@@ -70,7 +70,7 @@ describe("workspace-ready comment builders", () => {
     expect(buildWorkspaceReadyPresentation(input)).toEqual({
       kind: "system_notice",
       tone: "info",
-      title: "Workspace ready · PAP-16051-workspace-ready-notice",
+      title: "Workspace ready",
       density: "compact",
       detailsDefaultOpen: false,
     });
@@ -86,29 +86,20 @@ describe("workspace-ready comment builders", () => {
       tone: "warning",
       detailsDefaultOpen: true,
     });
-    expect(buildWorkspaceReadyMetadata(input).sections.at(-1)).toEqual({
-      title: "Warnings",
-      rows: [{ type: "text", text: "The worktree was restored from a stale reference." }],
+    expect(buildWorkspaceReadyMetadata(input).sections[0]?.rows).toContainEqual({
+      type: "key_value",
+      label: "Warning count",
+      value: "1",
     });
   });
 
-  it("truncates the presentation title to 160 characters", () => {
-    const presentation = buildWorkspaceReadyPresentation({
-      workspace: workspace({ branchName: "b".repeat(200) }),
-      runtimeServices: [],
-    });
-
-    expect(presentation.title).toHaveLength(160);
-    expect(presentation.title).toBe(`${`Workspace ready · ${"b".repeat(200)}`.slice(0, 159)}…`);
-  });
-
-  it("falls back to the workspace strategy when no branch is available", () => {
+  it("does not vary the presentation title with workspace identity", () => {
     const presentation = buildWorkspaceReadyPresentation({
       workspace: workspace({ branchName: null, strategy: "project_primary" }),
       runtimeServices: [],
     });
 
-    expect(presentation.title).toBe("Workspace ready · project_primary");
+    expect(presentation.title).toBe("Workspace ready");
   });
 
   it("builds structured workspace and service sections without an empty warnings section", () => {
@@ -131,9 +122,10 @@ describe("workspace-ready comment builders", () => {
         {
           title: "Workspace",
           rows: [
+            { type: "key_value", label: "Mode", value: "isolated_workspace" },
             { type: "key_value", label: "Strategy", value: "git_worktree" },
-            { type: "key_value", label: "Branch", value: "PAP-16051-workspace-ready-notice" },
-            { type: "key_value", label: "CWD", value: "/repo/.paperclip/worktrees/PAP-16051" },
+            { type: "key_value", label: "Worktree present", value: "yes" },
+            { type: "key_value", label: "Branch present", value: "yes" },
           ],
         },
         {
@@ -161,12 +153,20 @@ describe("workspace-ready comment builders", () => {
     });
   });
 
-  it("includes a distinct worktree row and preserves the existing markdown body", () => {
+  it("redacts workspace identity and diagnostics while preserving presence evidence", () => {
+    const sensitiveRepoUrl = "ssh://git.example.test/private/project.git";
+    const sensitiveBranch = "private/customer-branch";
+    const sensitiveCwd = "/private/repos/customer/runtime";
+    const sensitiveWorktree = "/private/repos/customer/worktrees/change";
+    const sensitiveDiagnostic = `Failed at ${sensitiveWorktree} on ${sensitiveBranch}`;
     const input = {
       workspace: workspace({
-        cwd: "/repo/runtime",
-        worktreePath: "/repo/.paperclip/worktrees/PAP-16051",
-        warnings: ["Warning text"],
+        repoUrl: sensitiveRepoUrl,
+        repoRef: "private/default-ref",
+        branchName: sensitiveBranch,
+        cwd: sensitiveCwd,
+        worktreePath: sensitiveWorktree,
+        warnings: [sensitiveDiagnostic],
       }),
       runtimeServices: [runtimeService({ reused: true })],
     };
@@ -174,21 +174,39 @@ describe("workspace-ready comment builders", () => {
     expect(buildWorkspaceReadyMetadata(input).sections[0]).toEqual({
       title: "Workspace",
       rows: [
+        { type: "key_value", label: "Mode", value: "isolated_workspace" },
         { type: "key_value", label: "Strategy", value: "git_worktree" },
-        { type: "key_value", label: "Branch", value: "PAP-16051-workspace-ready-notice" },
-        { type: "key_value", label: "CWD", value: "/repo/runtime" },
-        { type: "key_value", label: "Worktree", value: "/repo/.paperclip/worktrees/PAP-16051" },
+        { type: "key_value", label: "Worktree present", value: "yes" },
+        { type: "key_value", label: "Branch present", value: "yes" },
+        { type: "key_value", label: "Warning count", value: "1" },
       ],
     });
-    expect(buildWorkspaceReadyComment(input)).toBe([
+    const body = buildWorkspaceReadyComment(input);
+    expect(body).toBe([
       "## Workspace Ready",
       "",
+      "- Mode: `isolated_workspace`",
       "- Strategy: `git_worktree`",
-      "- Branch: `PAP-16051-workspace-ready-notice`",
-      "- CWD: `/repo/runtime`",
-      "- Worktree: `/repo/.paperclip/worktrees/PAP-16051`",
-      "- Warning: Warning text",
+      "- Worktree present: `yes`",
+      "- Branch present: `yes`",
+      "- Warning count: `1` (inspect the linked run for details)",
       "- Service: web: http://localhost:3100 (reused)",
     ].join("\n"));
+
+    const issueFacingPayload = JSON.stringify({
+      body,
+      presentation: buildWorkspaceReadyPresentation(input),
+      metadata: buildWorkspaceReadyMetadata(input),
+    });
+    for (const sensitiveValue of [
+      sensitiveRepoUrl,
+      "private/default-ref",
+      sensitiveBranch,
+      sensitiveCwd,
+      sensitiveWorktree,
+      sensitiveDiagnostic,
+    ]) {
+      expect(issueFacingPayload).not.toContain(sensitiveValue);
+    }
   });
 });

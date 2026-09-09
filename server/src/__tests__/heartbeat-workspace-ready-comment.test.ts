@@ -36,16 +36,17 @@ describe("heartbeat workspace-ready comment", () => {
       [
         "## Workspace Ready",
         "",
+        "- Mode: `isolated_workspace`",
         "- Strategy: `git_worktree`",
-        "- Branch: `PAP-16051-workspace-ready-notice`",
-        "- CWD: `/repo/.paperclip/worktrees/PAP-16051`",
+        "- Worktree present: `yes`",
+        "- Branch present: `yes`",
       ].join("\n"),
       { agentId: "agent-id", runId: "run-id" },
       {
         presentation: {
           kind: "system_notice",
           tone: "info",
-          title: "Workspace ready · PAP-16051-workspace-ready-notice",
+          title: "Workspace ready",
           density: "compact",
           detailsDefaultOpen: false,
         },
@@ -54,9 +55,10 @@ describe("heartbeat workspace-ready comment", () => {
           sections: [{
             title: "Workspace",
             rows: [
+              { type: "key_value", label: "Mode", value: "isolated_workspace" },
               { type: "key_value", label: "Strategy", value: "git_worktree" },
-              { type: "key_value", label: "Branch", value: "PAP-16051-workspace-ready-notice" },
-              { type: "key_value", label: "CWD", value: "/repo/.paperclip/worktrees/PAP-16051" },
+              { type: "key_value", label: "Worktree present", value: "yes" },
+              { type: "key_value", label: "Branch present", value: "yes" },
             ],
           }],
         },

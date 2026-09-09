@@ -47,7 +47,8 @@ describe("buildStrandedRecoveryEscalationNotice", () => {
     agentId: "4d5e6f70-8a9b-4c1d-8e2f-444444444444",
     status: "failed",
     errorCode: "workspace_validation_failed",
-    errorSummary: "Expected project worktree but resolved the agent fallback directory.",
+    errorSummary:
+      "Expected /private/repos/customer on branch private/customer-branch from ssh://git.example.test/private/project.git.",
   };
 
   it("emits system_notice presentation and the required metadata rows", () => {
@@ -83,11 +84,8 @@ describe("buildStrandedRecoveryEscalationNotice", () => {
       label: "Failure code",
       value: "workspace_validation_failed",
     });
-    expect(rows).toContainEqual({
-      type: "key_value",
-      label: "Failure summary",
-      value: sourceRun.errorSummary,
-    });
+    expect(rows.some((row) => row.label === "Failure summary")).toBe(false);
+    expect(JSON.stringify(notice)).not.toContain(sourceRun.errorSummary);
     expect(rows.some((row) => row.label === "Next action")).toBe(true);
   });
 
@@ -173,6 +171,11 @@ describe("buildStrandedRecoveryEscalationNotice", () => {
       type: "key_value",
       label: "Failure code",
       value: "provider_quota",
+    });
+    expect(allRows(notice.metadata)).toContainEqual({
+      type: "key_value",
+      label: "Failure summary",
+      value: "You've hit your limit · resets 2:30am (UTC)",
     });
   });
 

@@ -150,7 +150,14 @@ export function buildStrandedRecoveryEscalationNotice(input: {
     runRows.push(runLinkRow("Source run", input.sourceRun));
     const failureCode = input.sourceRun.errorCode?.trim();
     if (failureCode) runRows.push(keyValueRow("Failure code", failureCode));
-    const failureSummary = input.sourceRun.errorSummary?.trim();
+    // Workspace-validation errors routinely contain local paths, branch names,
+    // repository URLs, and command diagnostics. Keep that evidence on the
+    // linked run rather than copying it onto the company-visible issue thread.
+    const failureSummary =
+      input.recoveryCause === "workspace_validation_failed" ||
+      input.sourceRun.errorCode?.trim() === "workspace_validation_failed"
+        ? null
+        : input.sourceRun.errorSummary?.trim();
     if (failureSummary) runRows.push(keyValueRow("Failure summary", failureSummary));
   }
 

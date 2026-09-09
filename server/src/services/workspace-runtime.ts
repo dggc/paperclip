@@ -8798,17 +8798,24 @@ function workspaceReadyServiceLabel(serviceName: string): string {
     : label;
 }
 
+function workspaceReadyEffectiveMode(
+  workspace: RealizedExecutionWorkspace,
+): "isolated_workspace" | "shared_workspace" | "agent_home" | "task_session" {
+  if (workspace.strategy === "git_worktree") return "isolated_workspace";
+  if (workspace.source === "agent_home") return "agent_home";
+  if (workspace.source === "task_session") return "task_session";
+  return "shared_workspace";
+}
+
 export function buildWorkspaceReadyPresentation(
   input: WorkspaceReadyCommentInput,
 ): IssueCommentPresentation {
-  const workspaceLabel = input.workspace.branchName ?? input.workspace.strategy;
-  const title = `Workspace ready · ${workspaceLabel}`;
   const hasWarnings = input.workspace.warnings.length > 0;
 
   return {
     kind: "system_notice",
     tone: hasWarnings ? "warning" : "info",
-    title: title.length > 160 ? `${title.slice(0, 159)}…` : title,
+    title: "Workspace ready",
     density: "compact",
     detailsDefaultOpen: hasWarnings,
   };
@@ -8817,14 +8824,19 @@ export function buildWorkspaceReadyPresentation(
 export function buildWorkspaceReadyMetadata(
   input: WorkspaceReadyCommentInput,
 ): IssueCommentMetadata {
+  const hasWorktree = Boolean(input.workspace.worktreePath);
+  const hasBranch = Boolean(input.workspace.branchName);
   const workspaceRows: IssueCommentMetadata["sections"][number]["rows"] = [
+    { type: "key_value", label: "Mode", value: workspaceReadyEffectiveMode(input.workspace) },
     { type: "key_value", label: "Strategy", value: input.workspace.strategy },
-    ...(input.workspace.branchName
-      ? [{ type: "key_value" as const, label: "Branch", value: input.workspace.branchName }]
-      : []),
-    { type: "key_value", label: "CWD", value: input.workspace.cwd },
-    ...(input.workspace.worktreePath && input.workspace.worktreePath !== input.workspace.cwd
-      ? [{ type: "key_value" as const, label: "Worktree", value: input.workspace.worktreePath }]
+    { type: "key_value", label: "Worktree present", value: hasWorktree ? "yes" : "no" },
+    { type: "key_value", label: "Branch present", value: hasBranch ? "yes" : "no" },
+    ...(input.workspace.warnings.length > 0
+      ? [{
+          type: "key_value" as const,
+          label: "Warning count",
+          value: String(input.workspace.warnings.length),
+        }]
       : []),
   ];
   const serviceRows: IssueCommentMetadata["sections"][number]["rows"] = input.runtimeServices.map(
@@ -8840,26 +8852,18 @@ export function buildWorkspaceReadyMetadata(
     sections: [
       { title: "Workspace", rows: workspaceRows },
       ...(serviceRows.length > 0 ? [{ title: "Services", rows: serviceRows }] : []),
-      ...(input.workspace.warnings.length > 0
-        ? [{
-            title: "Warnings",
-            rows: input.workspace.warnings.map((warning) => ({ type: "text" as const, text: warning })),
-          }]
-        : []),
     ],
   };
 }
 
 export function buildWorkspaceReadyComment(input: WorkspaceReadyCommentInput) {
   const lines = ["## Workspace Ready", ""];
+  lines.push(`- Mode: \`${workspaceReadyEffectiveMode(input.workspace)}\``);
   lines.push(`- Strategy: \`${input.workspace.strategy}\``);
-  if (input.workspace.branchName) lines.push(`- Branch: \`${input.workspace.branchName}\``);
-  lines.push(`- CWD: \`${input.workspace.cwd}\``);
-  if (input.workspace.worktreePath && input.workspace.worktreePath !== input.workspace.cwd) {
-    lines.push(`- Worktree: \`${input.workspace.worktreePath}\``);
-  }
-  for (const warning of input.workspace.warnings) {
-    lines.push(`- Warning: ${warning}`);
+  lines.push(`- Worktree present: \`${input.workspace.worktreePath ? "yes" : "no"}\``);
+  lines.push(`- Branch present: \`${input.workspace.branchName ? "yes" : "no"}\``);
+  if (input.workspace.warnings.length > 0) {
+    lines.push(`- Warning count: \`${input.workspace.warnings.length}\` (inspect the linked run for details)`);
   }
   for (const service of input.runtimeServices) {
     const detail = service.url ? `${service.serviceName}: ${service.url}` : `${service.serviceName}: running`;
