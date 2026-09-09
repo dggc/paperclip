@@ -145,6 +145,7 @@ const projectFields = {
 export const createProjectSchema = z.object({
   ...projectFields,
   workspace: createProjectWorkspaceSchema.optional(),
+  repositoryIds: z.array(z.string().regex(/^\d+$/)).optional(),
 });
 
 export type CreateProject = z.infer<typeof createProjectSchema>;

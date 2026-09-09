@@ -124,7 +124,7 @@ fn build_metadata() -> serde_json::Value {
         "prp": {
             "name": "paperclip.runner",
             "minimumVersion": 1,
-            "maximumVersion": 1
+            "maximumVersion": 2
         },
         "prpTransportModes": ["dial_ws_loopback", "dial_wss", "listen_ws"]
     })
@@ -140,6 +140,16 @@ fn value(args: &[String], name: &str) -> Result<String, LocalRunnerError> {
         .ok_or_else(|| LocalRunnerError::invalid(format!("missing value for {name}")))
 }
 
+fn optional_value(args: &[String], name: &str) -> Result<Option<String>, LocalRunnerError> {
+    let Some(index) = args.iter().position(|argument| argument == name) else {
+        return Ok(None);
+    };
+    args.get(index + 1)
+        .cloned()
+        .map(Some)
+        .ok_or_else(|| LocalRunnerError::invalid(format!("missing value for {name}")))
+}
+
 fn optional_u64(args: &[String], name: &str) -> Result<Option<u64>, LocalRunnerError> {
     let Some(index) = args.iter().position(|argument| argument == name) else {
         return Ok(None);
@@ -151,16 +161,6 @@ fn optional_u64(args: &[String], name: &str) -> Result<Option<u64>, LocalRunnerE
         .parse::<u64>()
         .map(Some)
         .map_err(|error| LocalRunnerError::invalid(format!("invalid {name}: {error}")))
-}
-
-fn optional_value(args: &[String], name: &str) -> Result<Option<String>, LocalRunnerError> {
-    let Some(index) = args.iter().position(|argument| argument == name) else {
-        return Ok(None);
-    };
-    args.get(index + 1)
-        .cloned()
-        .map(Some)
-        .ok_or_else(|| LocalRunnerError::invalid(format!("missing value for {name}")))
 }
 
 fn acpx_launch_profile(args: &[String]) -> Result<Option<AcpxLaunchProfile>, LocalRunnerError> {

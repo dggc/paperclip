@@ -1,5 +1,5 @@
 {
-  "id": "b0c31a8a-4463-4ec4-854b-620aefb77dc5",
+  "id": "783697c3-158d-42c2-a958-942061519e58",
   "prevId": "79a857e0-0d4a-45a0-a0f0-d4cd485cf4fe",
   "version": "7",
   "dialect": "postgresql",
@@ -1601,28 +1601,6 @@
           ],
           "isUnique": true,
           "where": "\"agent_wakeup_requests\".\"idempotency_key\" LIKE 'issue_disposition_repair:%' AND \"agent_wakeup_requests\".\"status\" <> 'skipped'",
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "agent_wakeup_requests_execution_workspace_remediation_idempotency_uq": {
-          "name": "agent_wakeup_requests_execution_workspace_remediation_idempotency_uq",
-          "columns": [
-            {
-              "expression": "company_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "idempotency_key",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": true,
-          "where": "\"agent_wakeup_requests\".\"idempotency_key\" LIKE 'execution-workspace-remediation:%' AND \"agent_wakeup_requests\".\"status\" <> 'skipped'",
           "concurrently": false,
           "method": "btree",
           "with": {}
@@ -9276,6 +9254,100 @@
         "connection_event_deliveries_company_id_companies_id_fk": {
           "name": "connection_event_deliveries_company_id_companies_id_fk",
           "tableFrom": "connection_event_deliveries",
+          "tableTo": "companies",
+          "columnsFrom": [
+            "company_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.connection_intent_deliveries": {
+      "name": "connection_intent_deliveries",
+      "schema": "",
+      "columns": {
+        "interaction_id": {
+          "name": "interaction_id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "company_id": {
+          "name": "company_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "next_attempt_at": {
+          "name": "next_attempt_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "delivered_at": {
+          "name": "delivered_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "connection_intent_deliveries_pending_idx": {
+          "name": "connection_intent_deliveries_pending_idx",
+          "columns": [
+            {
+              "expression": "delivered_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "next_attempt_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "connection_intent_deliveries_interaction_id_issue_thread_interactions_id_fk": {
+          "name": "connection_intent_deliveries_interaction_id_issue_thread_interactions_id_fk",
+          "tableFrom": "connection_intent_deliveries",
+          "tableTo": "issue_thread_interactions",
+          "columnsFrom": [
+            "interaction_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "connection_intent_deliveries_company_id_companies_id_fk": {
+          "name": "connection_intent_deliveries_company_id_companies_id_fk",
+          "tableFrom": "connection_intent_deliveries",
           "tableTo": "companies",
           "columnsFrom": [
             "company_id"
